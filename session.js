@@ -12,6 +12,22 @@ export const ENFORCE_EXPIRY   = (process.env.ENFORCE_EXPIRY ?? 'false') === 'tru
 export const MAX_OPEN         = parseInt(process.env.MAX_OPEN_POSITIONS  || '40', 10);
 export const MAX_RISK_TOTAL   = parseFloat(process.env.MAX_RISK_PCT_TOTAL || '10');
 export const DEFAULT_RISK_PCT = parseFloat(process.env.DEFAULT_RISK_PCT   || '0.25');
+// Zet je RISK_PCT_OVERRIDE, dan wordt de risk_pct uit de webhook GENEGEERD en
+// geldt deze waarde voor elke trade. Zo draai je het risico terug zonder de
+// PineScript aan te raken en zonder opnieuw te deployen — één variabele in
+// Railway, opslaan, klaar. Leeg laten = de waarde uit de payload gebruiken.
+const _ovr = process.env.RISK_PCT_OVERRIDE;
+export const RISK_OVERRIDE = (_ovr !== undefined && _ovr !== '') ? parseFloat(_ovr) : null;
+
+/** Welk risico geldt er voor deze order? Override wint, dan payload, dan default. */
+export function resolveRiskPct(payloadValue) {
+  if (RISK_OVERRIDE !== null && !Number.isNaN(RISK_OVERRIDE)) {
+    return { pct: RISK_OVERRIDE, bron: 'RISK_PCT_OVERRIDE' };
+  }
+  const p = parseFloat(payloadValue);
+  if (p > 0) return { pct: p, bron: 'payload' };
+  return { pct: DEFAULT_RISK_PCT, bron: 'DEFAULT_RISK_PCT' };
+}
 export const TRACK_INTERVAL   = parseInt(process.env.TRACK_INTERVAL_SEC  || '60', 10) * 1000;
 // Maximaal toegestaan verschil tussen de futures-prijs van TradingView en de
 // CFD-prijs van de broker. Klopt de mapping niet (MGC1! -> een Nasdaq-symbool),
