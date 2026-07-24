@@ -54,6 +54,25 @@ werkelijke MT5-fill.
 **Houdtijd is onbegrensd.** Een positie loopt tot SL of TP. `expires_at` wordt
 gelogd maar niet afgedwongen, tenzij je `ENFORCE_EXPIRY=true` zet.
 
+## Waar stel je het risico in?
+
+Op drie plekken, met deze voorrang:
+
+| Plek | Werkt op | Wijzigen |
+|---|---|---|
+| `RISK_PCT_OVERRIDE` (Railway) | **alles, wint altijd** | variabele opslaan, geen redeploy |
+| `risk_pct` in de webhook | per slot | PineScript-input `Risk % per trade` |
+| `DEFAULT_RISK_PCT` | alleen als de payload niets meestuurt | Railway |
+
+`railway.toml` doet hier niets aan mee — dat is uitsluitend build- en
+deploy-configuratie. Variabelen horen in het tabblad **Variables**.
+
+Wil je snel terug in risico: zet `RISK_PCT_OVERRIDE=0.1` en sla op. Elke
+volgende order gebruikt 0,1%, ongeacht wat TradingView stuurt. Veld weer
+leegmaken en de payload telt weer.
+
+`/health` toont welke van de drie momenteel actief is.
+
 ## Remmen
 
 Met onbeperkte houdtijd stapelen posities op. Twee grenzen:
