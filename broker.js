@@ -6,7 +6,7 @@
 // esm-node-subpad gebruiken — dat is geen detail, dat is het verschil tussen
 // draaien en niet draaien.
 import MetaApi from 'metaapi.cloud-sdk/esm-node';
-import { SPECS } from './session.js';
+import { SPECS, actieveSymbolen } from './session.js';
 
 let connection = null;
 let account    = null;
@@ -94,7 +94,9 @@ export async function equity() {
  */
 export async function verifySpecs() {
   const out = [];
-  for (const [sym, mine] of Object.entries(SPECS)) {
+  for (const sym of actieveSymbolen()) {
+    const mine = SPECS[sym];
+    if (!mine) { out.push(`${sym}: geen specificatie in session.js`); continue; }
     try {
       const s = await connection.getSymbolSpecification(sym);
       if (!s) { out.push(`${sym}: niet gevonden bij deze broker`); continue; }
