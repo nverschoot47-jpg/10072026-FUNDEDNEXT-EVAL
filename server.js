@@ -13,6 +13,7 @@ import * as tracker from './tracker.js';
 import {
   FIRM, TRADING_ENABLED, MAX_OPEN, MAX_RISK_TOTAL, DEFAULT_RISK_PCT,
   mapSymbol, calcLots, SPECS, firmConfig, convertToMt5, scaleLevel, MAX_BASIS_PCT,
+  resolveRiskPct, RISK_OVERRIDE,
 } from './session.js';
 
 const app = express();
@@ -63,7 +64,7 @@ async function handleOrder(o) {
   // Blootstellingsremmen. Met onbeperkte houdtijd lopen open posities op, dus
   // dit is de enige rem die er is.
   const { total, n } = await db.openRiskPct();
-  const riskPct = parseFloat(o.risk_pct) || DEFAULT_RISK_PCT;
+  const { pct: riskPct, bron: riskBron } = resolveRiskPct(o.risk_pct);
   if (n >= MAX_OPEN) {
     const r = `MAX_OPEN_POSITIONS bereikt (${n}/${MAX_OPEN})`;
     await db.pool.query('UPDATE signals SET status=$2, reason=$3 WHERE id=$1', [sig.id, 'rejected', r]);
@@ -137,7 +138,7 @@ async function handleOrder(o) {
     });
 
     console.log(`[Order] ${o.slot_id} ${o.action} ${mt5} ${sizing.lots} lots @ ${res.fill} ` +
-                `SL ${res.sl} TP ${res.tp} | stop ${slTv}tv -> ${cv.slPointsMt5}mt5 ` +
+                `SL ${res.sl} TP ${res.tp} | risk ${riskPct}% (${riskBron}) | stop ${slTv}tv -> ${cv.slPointsMt5}mt5 ` +
                 `(${(cv.slPct * 100).toFixed(4)}%, basis ${cv.basisPct !== null ? (cv.basisPct * 100).toFixed(2) + '%' : 'n/b'})`);
     return { slot_id: o.slot_id, ok: true, order_id: orderId, lots: sizing.lots,
              fill: res.fill, sl_points_mt5: cv.slPointsMt5 };
@@ -191,6 +192,7 @@ app.get('/health', async (_req, res) => {
       trading: TRADING_ENABLED, broker: broker.isReady(),
       open_positions: n, open_risk_pct: total,
       limits: { max_open: MAX_OPEN, max_risk_pct: MAX_RISK_TOTAL },
+      risk_per_trade: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit de webhook',
     });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
