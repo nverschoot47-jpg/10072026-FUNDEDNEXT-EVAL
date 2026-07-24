@@ -70,6 +70,13 @@ export const SPECS = {
   'US100.cash': { tickSize: 0.01, tickValue: 0.1, volMin: 0.01, volMax: 40, volStep: 0.01, digits: 2 },
 };
 
+/** Alleen de symbolen die deze firm daadwerkelijk gebruikt. De opstartcontrole
+ *  liep eerst over ALLE specs heen, inclusief die van een andere firm — vandaar
+ *  de "US100.cash niet gevonden" ruis bij FundedNext. */
+export function actieveSymbolen() {
+  return [...new Set(Object.values(firmConfig().symbols))];
+}
+
 export function firmConfig() {
   const f = FIRMS[FIRM];
   if (!f) throw new Error(`Onbekende FIRM "${FIRM}". Bekend: ${Object.keys(FIRMS).join(', ')}`);
