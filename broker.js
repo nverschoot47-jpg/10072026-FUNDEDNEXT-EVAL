@@ -1,7 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // broker.js — MetaApi/MT5. Eén RPC-verbinding die open blijft.
 // ═══════════════════════════════════════════════════════════════════════════
-import MetaApi from 'metaapi.cloud-sdk';
+// LET OP: het standaard-import van dit pakket wijst naar de BROWSER-build.
+// Die valt in Node om met "window is not defined". Voor Node ESM moet je het
+// esm-node-subpad gebruiken — dat is geen detail, dat is het verschil tussen
+// draaien en niet draaien.
+import MetaApi from 'metaapi.cloud-sdk/esm-node';
 import { SPECS } from './session.js';
 
 let connection = null;
