@@ -10,6 +10,7 @@ import express from 'express';
 import * as db from './db.js';
 import * as broker from './broker.js';
 import * as tracker from './tracker.js';
+import * as guard from './guard.js';
 import {
   FIRM, TRADING_ENABLED, MAX_OPEN, MAX_RISK_TOTAL, DEFAULT_RISK_PCT,
   mapSymbol, calcLots, SPECS, firmConfig, convertToMt5, scaleLevel, MAX_BASIS_PCT,
@@ -53,6 +54,15 @@ async function handleOrder(o) {
   }
   if (!SPECS[mt5]) {
     const r = `geen contractspecificatie voor ${mt5}`;
+    await db.insertSignal(FIRM, o, mt5, 'rejected', r);
+    return { slot_id: o.slot_id, ok: false, reason: r };
+  }
+
+  // ── Circuit breaker ─────────────────────────────────────────────────
+  // Staat de schakelaar om, dan wordt het signaal wél gelogd maar niet geplaatst.
+  const brk = await guard.status();
+  if (brk.tripped) {
+    const r = `circuit breaker actief: ${brk.reason}`;
     await db.insertSignal(FIRM, o, mt5, 'rejected', r);
     return { slot_id: o.slot_id, ok: false, reason: r };
   }
@@ -122,9 +132,14 @@ async function handleOrder(o) {
 
     const slippage = entryTv ? +(res.fill - ref).toFixed(5) : null;
 
+    // ── Datavaliditeit ────────────────────────────────────────────────
+    // De order is geplaatst; nu markeren of hij mag meetellen in de statistiek.
+    const dq = guard.checkData(o, { conversieGeschaald: cv.scaled, basisPct: cv.basisPct });
+
     const orderId = await db.insertOrder({
       signal_id: sig.id, firm: FIRM, slot_id: o.slot_id, mt5_symbol: mt5,
       account_id: broker.accountId(),
+      valid: dq.valid, invalid_reason: dq.valid ? null : dq.reasons.join('; '),
       action: o.action, volume: sizing.lots,
       entry_tv: entryTv, fill_price: res.fill, slippage,
       sl_price: res.sl, tp_price: res.tp,
@@ -139,6 +154,7 @@ async function handleOrder(o) {
       position_id: String(res.positionId), mt5_order_id: String(res.orderId), status: 'open',
     });
 
+    if (!dq.valid) console.warn(`[Data] ${o.slot_id} gemarkeerd als INVALID — ${dq.reasons.join('; ')}`);
     console.log(`[Order] ${o.slot_id} ${o.action} ${mt5} ${sizing.lots} lots @ ${res.fill} ` +
                 `SL ${res.sl} TP ${res.tp} | risk ${riskPct}% (${riskBron}) | stop ${slTv}tv -> ${cv.slPointsMt5}mt5 ` +
                 `(${(cv.slPct * 100).toFixed(4)}%, basis ${cv.basisPct !== null ? (cv.basisPct * 100).toFixed(2) + '%' : 'n/b'})`);
@@ -178,7 +194,16 @@ app.post('/webhook', async (req, res) => {
   for (const o of orders) {
     try { results.push(await handleOrder(o)); }
     catch (e) {
+      // Vangnet: ook als het wegschrijven zelf faalt, moet het signaal niet
+      // spoorloos verdwijnen. De ruwe payload gaat hoe dan ook naar errors.
       await db.logError('webhook', e.message, o);
+      try {
+        await db.pool.query(
+          `INSERT INTO signals (firm, slot_id, action, tv_symbol, status, reason, raw)
+           VALUES ($1,$2,$3,$4,'error',$5,$6)`,
+          [FIRM, o?.slot_id ?? 'onbekend', o?.action ?? null, o?.symbol ?? null,
+           e.message.slice(0, 500), JSON.stringify(o ?? {})]);
+      } catch { /* database zelf onbereikbaar; errors-tabel heeft het al */ }
       results.push({ slot_id: o?.slot_id, ok: false, reason: e.message });
     }
   }
@@ -213,6 +238,28 @@ app.post('/reconnect', async (req, res) => {
   }
 });
 
+app.get('/ghosts', async (_req, res) => {
+  try { res.json(await db.ghostSummary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/breaker', async (_req, res) => {
+  try { res.json(await guard.status()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/breaker/reset', async (req, res) => {
+  if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  await guard.reset('handmatig via API');
+  res.json({ ok: true });
+});
+
+app.post('/breaker/trip', async (req, res) => {
+  if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  await guard.trip(req.query.reason || 'handmatig gestopt');
+  res.json({ ok: true });
+});
+
 app.get('/slots', async (_req, res) => {
   try { res.json(await db.slotPerformance()); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -229,6 +276,7 @@ app.get('/', async (_req, res) => {
                account: broker.accountId(), open_positions: n, open_risk_pct: total,
                risk: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit webhook' };
     slots  = await db.slotPerformance();
+    health.breaker = await guard.status();
     recent = (await db.pool.query(
       `SELECT received_at, slot_id, action, status, reason FROM signals
         ORDER BY id DESC LIMIT 25`)).rows;
@@ -264,6 +312,7 @@ app.get('/', async (_req, res) => {
  <div class="row"><span class="k">risico p/trade</span><span>${health.risk}</span></div>
  <div class="row"><span class="k">open posities</span><span>${health.open_positions ?? 0}</span></div>
  <div class="row"><span class="k">open risico</span><span>${(health.open_risk_pct ?? 0).toFixed?.(2) ?? 0}%</span></div>
+ <div class="row"><span class="k">circuit breaker</span><span class="${health.breaker?.tripped ? 'bad' : 'ok'}">${health.breaker?.tripped ? 'GESPRONGEN — ' + health.breaker.reason : 'ok'}</span></div>
 </div>
 
 <div class="card"><h2>per slot</h2><div class="wrap"><table>
