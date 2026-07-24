@@ -15,12 +15,38 @@ export const pool = new pg.Pool({
 });
 
 export async function initSchema() {
+  // Bijhouden wat er al gedraaid heeft. Zonder dit draait élk .sql-bestand bij
+  // iedere herstart opnieuw — meestal onschuldig, maar niet als een latere
+  // migratie een view of kolom herdefinieert. Dan draai je jezelf in een kringetje.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      filename   TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+
+  const done = new Set(
+    (await pool.query('SELECT filename FROM schema_migrations')).rows.map(r => r.filename));
+
   const dir = path.join(__dirname, 'migrations');
   const files = fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort();
+
   for (const f of files) {
+    if (done.has(f)) { console.log(`[DB] ${f} al toegepast, overgeslagen`); continue; }
     const sql = fs.readFileSync(path.join(dir, f), 'utf8');
-    await pool.query(sql);
-    console.log(`[DB] ${f} toegepast`);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(sql);
+      await client.query('INSERT INTO schema_migrations (filename) VALUES ($1)', [f]);
+      await client.query('COMMIT');
+      console.log(`[DB] ${f} toegepast`);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error(`[DB] ${f} MISLUKT: ${e.message}`);
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 }
 
