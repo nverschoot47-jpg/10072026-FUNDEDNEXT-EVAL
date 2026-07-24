@@ -19,7 +19,14 @@ UPDATE orders  SET account_id = 'legacy' WHERE account_id IS NULL;
 UPDATE signals SET account_id = 'legacy' WHERE account_id IS NULL;
 
 -- Prestatie per slot, nu ook uitsplitsbaar per account.
-CREATE OR REPLACE VIEW slot_performance AS
+--
+-- LET OP: CREATE OR REPLACE VIEW kan in Postgres géén kolommen hernoemen of
+-- van volgorde wisselen — alleen achteraan toevoegen. account_id komt vooraan
+-- te staan, dus de view moet eerst weg. Een view bevat geen data, dus dat is
+-- gratis.
+DROP VIEW IF EXISTS slot_performance;
+
+CREATE VIEW slot_performance AS
 SELECT
   o.account_id,
   o.slot_id,
