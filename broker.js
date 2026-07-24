@@ -10,25 +10,74 @@ import { SPECS } from './session.js';
 
 let connection = null;
 let account    = null;
+let lastErr    = null;          // waarom de verbinding niet lukte
+
+export function lastError() { return lastErr; }
+
+let currentAccountId = null;
+/** Het account waar we NU op handelen. Wordt bij elke order meegeschreven. */
+export function accountId() { return currentAccountId; }
 
 export async function connect() {
-  const token     = process.env.META_API_TOKEN;
-  const accountId = process.env.META_ACCOUNT_ID;
-  if (!token || !accountId) throw new Error('META_API_TOKEN of META_ACCOUNT_ID ontbreekt');
+  lastErr = null;
 
-  const api = new MetaApi(token);
-  account = await api.metatraderAccountApi.getAccount(accountId);
+  // Accepteer meerdere schrijfwijzen. De variabelenaam is een stomme reden om
+  // niet te kunnen handelen, dus we kijken gewoon naar alles wat het kan zijn.
+  const token = process.env.META_API_TOKEN
+             || process.env.METAAPI_TOKEN
+             || process.env.META_TOKEN;
+  const accountId = process.env.META_ACCOUNT_ID
+                 || process.env.META_ACCOUNT
+                 || process.env.METAAPI_ACCOUNT_ID
+                 || process.env.METAAPI_ACCOUNT;
 
-  if (account.state !== 'DEPLOYED') { await account.deploy(); }
-  await account.waitConnected();
+  if (!token || !accountId) {
+    lastErr = `ontbrekende variabelen — token: ${token ? 'ok' : 'ONTBREEKT'}, ` +
+              `account: ${accountId ? 'ok' : 'ONTBREEKT'}. ` +
+              `Gezocht naar META_API_TOKEN / METAAPI_TOKEN en ` +
+              `META_ACCOUNT_ID / META_ACCOUNT / METAAPI_ACCOUNT_ID.`;
+    throw new Error(lastErr);
+  }
+  currentAccountId = String(accountId);
+  console.log(`[MT5] account ${currentAccountId.slice(0, 8)}… , token ${token.length} tekens`);
 
-  connection = account.getRPCConnection();
-  await connection.connect();
-  await connection.waitSynchronized();
+  try {
+    // Sommige tokens zijn aan een regio-domein gebonden. Staat META_BASE of
+    // META_DOMAIN gezet, dan gebruiken we dat.
+    const dom = process.env.META_DOMAIN || null;
+    const api = dom ? new MetaApi(token, { domain: dom }) : new MetaApi(token);
 
-  const info = await connection.getAccountInformation();
-  console.log(`[MT5] verbonden — ${info.broker} | equity ${info.equity} ${info.currency}`);
-  return info;
+    account = await api.metatraderAccountApi.getAccount(accountId);
+    console.log(`[MT5] account gevonden: ${account.name || '(geen naam)'} — state ${account.state}`);
+
+    if (account.state !== 'DEPLOYED') {
+      console.log('[MT5] account niet deployed, deployen…');
+      await account.deploy();
+    }
+    await account.waitConnected();
+
+    connection = account.getRPCConnection();
+    await connection.connect();
+    await connection.waitSynchronized();
+
+    const info = await connection.getAccountInformation();
+    console.log(`[MT5] verbonden — ${info.broker} | equity ${info.equity} ${info.currency}`);
+    return info;
+
+  } catch (e) {
+    connection = null;
+    lastErr = e.message || String(e);
+    // MetaApi verpakt de echte reden vaak in details.
+    if (e.details) lastErr += ' | details: ' + JSON.stringify(e.details).slice(0, 300);
+    if (e.status)  lastErr += ` | http ${e.status}`;
+    throw new Error(lastErr);
+  }
+}
+
+/** Opnieuw proberen zonder herstart — handig na het corrigeren van een variabele. */
+export async function reconnect() {
+  connection = null;
+  return await connect();
 }
 
 export function isReady() { return !!connection; }
