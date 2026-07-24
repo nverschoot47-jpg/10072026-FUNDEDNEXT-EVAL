@@ -45,7 +45,7 @@ export async function insertSignal(firm, o, mt5Symbol, status, reason) {
     o.entry ?? null, o.sl_points ?? null, o.tp_points ?? null, o.rr ?? null, o.sl_mult ?? null,
     o.orb_start ?? null, o.orb_minutes ?? null, o.orb_high ?? null, o.orb_low ?? null,
     o.vwap_side ?? null, o.vwap ?? null, o.risk_pct ?? null, o.expires_at ?? null,
-    status, reason ?? null, JSON.stringify(o)];
+    status, reason ?? null, JSON.stringify(o), o.__account ?? null];
   const ph = cols.map((_, i) => `$${i + 1}`).join(',');
   const q  = `INSERT INTO signals (${cols.join(',')}) VALUES (${ph}) RETURNING id`;
 
@@ -69,7 +69,7 @@ export async function insertOrder(row) {
     'entry_tv','fill_price','slippage','sl_price','tp_price','sl_points','tp_points',
     'sl_points_tv','tp_points_tv','sl_pct','tp_pct','basis','basis_pct',
     'orb_high_mt5','orb_low_mt5','vwap_mt5',
-    'risk_amount','equity_at_open','position_id','mt5_order_id','status','error'];
+    'risk_amount','equity_at_open','position_id','mt5_order_id','status','error','account_id'];
   const ph = cols.map((_, i) => `$${i + 1}`).join(',');
   const r = await pool.query(
     `INSERT INTO orders (${cols.join(',')}) VALUES (${ph}) RETURNING id`,
@@ -77,11 +77,26 @@ export async function insertOrder(row) {
   return r.rows[0].id;
 }
 
-export async function openOrders() {
+/** Alleen de open orders van HET HUIDIGE account. Rijen van een vorig account
+ *  blijven met rust — die posities bestaan hier niet en zouden verkeerd
+ *  worden afgeboekt. */
+export async function openOrders(accountId) {
   const r = await pool.query(
     `SELECT id, slot_id, mt5_symbol, action, volume, fill_price, sl_price, tp_price,
             sl_points, risk_amount, position_id, placed_at
-       FROM orders WHERE status = 'open' AND position_id IS NOT NULL`);
+       FROM orders
+      WHERE status = 'open' AND position_id IS NOT NULL
+        AND account_id IS NOT DISTINCT FROM $1`, [accountId]);
+  return r.rows;
+}
+
+/** Open orders die bij een ANDER account horen — puur om voor te waarschuwen. */
+export async function strandedOrders(accountId) {
+  const r = await pool.query(
+    `SELECT account_id, COUNT(*)::int AS n
+       FROM orders
+      WHERE status = 'open' AND account_id IS DISTINCT FROM $1
+      GROUP BY account_id`, [accountId]);
   return r.rows;
 }
 
