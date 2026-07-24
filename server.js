@@ -58,6 +58,7 @@ async function handleOrder(o) {
   }
 
   // Dubbele webhook? De unieke index op (slot_id, dag) vangt dit af.
+  o.__account = broker.accountId();
   const sig = await db.insertSignal(FIRM, o, mt5, 'accepted', null);
   if (sig.duplicate) return { slot_id: o.slot_id, ok: false, reason: 'duplicate (slot vuurde vandaag al)' };
 
@@ -123,6 +124,7 @@ async function handleOrder(o) {
 
     const orderId = await db.insertOrder({
       signal_id: sig.id, firm: FIRM, slot_id: o.slot_id, mt5_symbol: mt5,
+      account_id: broker.accountId(),
       action: o.action, volume: sizing.lots,
       entry_tv: entryTv, fill_price: res.fill, slippage,
       sl_price: res.sl, tp_price: res.tp,
@@ -148,6 +150,7 @@ async function handleOrder(o) {
     await db.pool.query('UPDATE signals SET status=$2, reason=$3 WHERE id=$1', [sig.id, 'error', e.message]);
     await db.insertOrder({
       signal_id: sig.id, firm: FIRM, slot_id: o.slot_id, mt5_symbol: mt5, action: o.action,
+      account_id: broker.accountId(),
       volume: sizing.lots, entry_tv: entryTv, fill_price: null, slippage: null,
       sl_price: null, tp_price: null, sl_points: cv.slPointsMt5, tp_points: cv.tpPointsMt5,
       sl_points_tv: slTv, tp_points_tv: tpTv, sl_pct: cv.slPct, tp_pct: cv.tpPct,
@@ -190,11 +193,24 @@ app.get('/health', async (_req, res) => {
     res.json({
       ok: true, firm: FIRM, label: firmConfig().label,
       trading: TRADING_ENABLED, broker: broker.isReady(),
+      broker_error: broker.isReady() ? null : broker.lastError(),
+      account: broker.accountId(),
       open_positions: n, open_risk_pct: total,
       limits: { max_open: MAX_OPEN, max_risk_pct: MAX_RISK_TOTAL },
       risk_per_trade: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit de webhook',
     });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Handmatig opnieuw verbinden nadat je een variabele hebt gecorrigeerd.
+app.post('/reconnect', async (req, res) => {
+  if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const info = await broker.reconnect();
+    res.json({ ok: true, broker: info.broker, equity: info.equity });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.get('/slots', async (_req, res) => {
@@ -217,6 +233,11 @@ app.get('/', (_req, res) => res.type('text').send(
         issues.forEach(i => console.warn('   ' + i));
       } else {
         console.log('[MT5] contractspecificaties komen overeen met session.js');
+      }
+      const stranded = await db.strandedOrders(broker.accountId());
+      if (stranded.length) {
+        console.warn('[MT5] LET OP — open orders van (een) ander account in de database:');
+        stranded.forEach(r => console.warn(`   account ${r.account_id}: ${r.n} open order(s) — worden genegeerd`));
       }
       tracker.start();
     } catch (e) {
