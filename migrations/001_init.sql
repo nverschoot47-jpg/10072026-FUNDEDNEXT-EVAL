@@ -105,7 +105,11 @@ CREATE TABLE IF NOT EXISTS errors (
 );
 
 -- Per slot: hoeveel getriggerd, hoeveel gesloten, gemiddelde R.
-CREATE OR REPLACE VIEW slot_performance AS
+-- DROP eerst: 003 hangt er een kolom vóór, en CREATE OR REPLACE kan kolommen
+-- niet hernoemen. Zonder deze regel klapt een herstart eruit.
+DROP VIEW IF EXISTS slot_performance;
+
+CREATE VIEW slot_performance AS
 SELECT
   o.slot_id,
   o.mt5_symbol,
