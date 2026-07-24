@@ -1,0 +1,445 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// PRONTO ORB · MULTI-SLOT LIVE + BACKTEST   →  Railway / MetaApi / MT5
+//
+// Elke regel uit de scanner-tabel is één slot. Kies bovenaan het preset MGC of
+// MNQ en beide tabellen staan er kant-en-klaar in; "Handmatig" gebruikt de
+// slot-velden eronder.
+//
+// ÉÉN TRADE PER (STARTTIJD + ORB-LENGTE)
+//   De scanner geeft dezelfde vorm vaak meerdere keren terug, alleen met een
+//   andere SL-multiplier of RR. Dat is dezelfde breuk, niet drie kansen. Zonder
+//   filter vertrekken er drie orders op één koersbeweging en handel je 3× je
+//   risico. Daarom wordt per (start + ORB) alleen de regel met de HOOGSTE EV
+//   scherpgezet; de rest wordt geblokkeerd en staat grijs in de tabel.
+//
+// Draait op één symbool. Zet hem twee keer neer: MGC-chart met preset MGC,
+// MNQ-chart met preset MNQ.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("PRONTO ORB · Multi-Slot Live", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+gA = "① Algemeen"
+gB = "② Risico & exit"
+gC = "③ Weergave"
+
+preset  = input.string("MGC", "Preset", options = ["MGC", "MNQ", "Handmatig"], group = gA,
+     tooltip = "MGC / MNQ = de scanner-tabellen zoals gemeten. Handmatig = eigen slots.")
+TZ      = input.string("Europe/Brussels", "Tijdzone",
+     options = ["Europe/Brussels", "America/New_York", "GMT+1", "GMT+0"], group = gA)
+symOver = input.string("", "Symbool override (leeg = chart-ticker)", group = gA)
+alertsAan = input.bool(true, "Webhook-alerts aan", group = gA)
+
+winU    = input.float(2.0, "Handelsvenster na ORB (uur)", minval = 0.25, step = 0.25, group = gB)
+houdMin = input.int(120, "Max houdtijd (minuten)", minval = 5, step = 5, group = gB)
+riskPct = input.float(0.25, "Risk % per trade", minval = 0.01, step = 0.05, group = gB)
+minAtrFrac = input.float(0.0, "Vloer stopafstand (× ATR, 0 = uit)", minval = 0.0, step = 0.05, group = gB,
+     tooltip = "0 = zuiver model: SL-afstand is precies entry → andere kant van de ORB,\n" +
+               "maal de multiplier. Verder niets.\n\n" +
+               "Boven 0 zet je een ondergrens onder die afstand, zodat een doodstille\n" +
+               "ORB geen stop van twee ticks oplevert. Dat is een vangnet, geen deel van\n" +
+               "de strategie.\n\n" +
+               "MOET gelijkstaan aan de scanner — anders is de gemeten EV niet van dít model.")
+atrLen  = input.int(14, "ATR-lengte (alleen voor de vloer)", minval = 2, group = gB)
+
+strictSym = input.bool(true, "Blokkeer als preset niet bij het chartsymbool past", group = gA,
+     tooltip = "Preset MGC op een MNQ-chart levert goud-signalen op een Nasdaq-chart.\n" +
+               "Met deze schakelaar aan wordt dan NIETS getekend en NIETS verstuurd.")
+
+lijnBars = input.int(8, "SL/TP lijnlengte (bars)", minval = 2, maxval = 60, group = gC,
+     tooltip = "Korte stompjes rechts van de entry. Niet doorlopend tot de exit.")
+labelVol = input.bool(false, "Volledig label (i.p.v. pijl + tooltip)", group = gC)
+toonBox  = input.bool(true, "ORB-boxen",     group = gC)
+toonLbl  = input.bool(true, "Entry-labels",  group = gC)
+toonLijn = input.bool(true, "SL/TP-lijnen",  group = gC)
+toonTab  = input.bool(true, "Controletabel", group = gC)
+toonGeblok = input.bool(false, "Geblokkeerde slots in tabel tonen", group = gC)
+toonVwap = input.bool(true, "VWAP tekenen", group = gC)
+vwAnker  = input.string("Sessie", "VWAP-anker", options = ["Sessie", "Dag (tijdzone)"], group = gC,
+     tooltip = "Sessie = reset bij de futures-sessieopen. Dít gebruikt de scanner ook.\n" +
+               "Dag = reset om 00:00 in de gekozen tijdzone.\n\n" +
+               "Het anker bepaalt of een breuk boven of onder VWAP ligt, en dus of hij als\n" +
+               "Met of Tegen telt. Wijk je hier af van de scanner, dan neem je andere trades\n" +
+               "dan je gemeten hebt.")
+
+g1 = "Slot 01 (handmatig)"
+on1  = input.bool(true, "actief", group = g1, inline = "a1")
+dir1 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g1, inline = "a1")
+hh1  = input.int(2, "start", minval = 0, maxval = 23, group = g1, inline = "b1")
+mm1  = input.int(30, ":", minval = 0, maxval = 59, group = g1, inline = "b1")
+orb1 = input.int(15, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g1, inline = "b1")
+mul1 = input.float(1.5, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g1, inline = "c1")
+vw1  = input.string("Met", "VWAP", options = ["Met","Tegen","Uit"], group = g1, inline = "c1")
+rr1  = input.float(3.5, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g1, inline = "c1")
+ev1  = input.float(18.64, "EV pts (voorrang)", step = 0.01, group = g1, inline = "d1")
+g2 = "Slot 02 (handmatig)"
+on2  = input.bool(true, "actief", group = g2, inline = "a2")
+dir2 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g2, inline = "a2")
+hh2  = input.int(16, "start", minval = 0, maxval = 23, group = g2, inline = "b2")
+mm2  = input.int(0, ":", minval = 0, maxval = 59, group = g2, inline = "b2")
+orb2 = input.int(30, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g2, inline = "b2")
+mul2 = input.float(2.5, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g2, inline = "c2")
+vw2  = input.string("Tegen", "VWAP", options = ["Met","Tegen","Uit"], group = g2, inline = "c2")
+rr2  = input.float(1.0, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g2, inline = "c2")
+ev2  = input.float(17.78, "EV pts (voorrang)", step = 0.01, group = g2, inline = "d2")
+g3 = "Slot 03 (handmatig)"
+on3  = input.bool(true, "actief", group = g3, inline = "a3")
+dir3 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g3, inline = "a3")
+hh3  = input.int(16, "start", minval = 0, maxval = 23, group = g3, inline = "b3")
+mm3  = input.int(0, ":", minval = 0, maxval = 59, group = g3, inline = "b3")
+orb3 = input.int(30, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g3, inline = "b3")
+mul3 = input.float(2.0, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g3, inline = "c3")
+vw3  = input.string("Tegen", "VWAP", options = ["Met","Tegen","Uit"], group = g3, inline = "c3")
+rr3  = input.float(1.0, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g3, inline = "c3")
+ev3  = input.float(17.38, "EV pts (voorrang)", step = 0.01, group = g3, inline = "d3")
+g4 = "Slot 04 (handmatig)"
+on4  = input.bool(true, "actief", group = g4, inline = "a4")
+dir4 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g4, inline = "a4")
+hh4  = input.int(16, "start", minval = 0, maxval = 23, group = g4, inline = "b4")
+mm4  = input.int(0, ":", minval = 0, maxval = 59, group = g4, inline = "b4")
+orb4 = input.int(25, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g4, inline = "b4")
+mul4 = input.float(2.0, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g4, inline = "c4")
+vw4  = input.string("Tegen", "VWAP", options = ["Met","Tegen","Uit"], group = g4, inline = "c4")
+rr4  = input.float(1.0, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g4, inline = "c4")
+ev4  = input.float(16.93, "EV pts (voorrang)", step = 0.01, group = g4, inline = "d4")
+g5 = "Slot 05 (handmatig)"
+on5  = input.bool(true, "actief", group = g5, inline = "a5")
+dir5 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g5, inline = "a5")
+hh5  = input.int(7, "start", minval = 0, maxval = 23, group = g5, inline = "b5")
+mm5  = input.int(0, ":", minval = 0, maxval = 59, group = g5, inline = "b5")
+orb5 = input.int(25, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g5, inline = "b5")
+mul5 = input.float(2.5, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g5, inline = "c5")
+vw5  = input.string("Met", "VWAP", options = ["Met","Tegen","Uit"], group = g5, inline = "c5")
+rr5  = input.float(1.5, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g5, inline = "c5")
+ev5  = input.float(16.64, "EV pts (voorrang)", step = 0.01, group = g5, inline = "d5")
+g6 = "Slot 06 (handmatig)"
+on6  = input.bool(true, "actief", group = g6, inline = "a6")
+dir6 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g6, inline = "a6")
+hh6  = input.int(2, "start", minval = 0, maxval = 23, group = g6, inline = "b6")
+mm6  = input.int(30, ":", minval = 0, maxval = 59, group = g6, inline = "b6")
+orb6 = input.int(15, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g6, inline = "b6")
+mul6 = input.float(2.0, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g6, inline = "c6")
+vw6  = input.string("Met", "VWAP", options = ["Met","Tegen","Uit"], group = g6, inline = "c6")
+rr6  = input.float(2.5, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g6, inline = "c6")
+ev6  = input.float(16.36, "EV pts (voorrang)", step = 0.01, group = g6, inline = "d6")
+g7 = "Slot 07 (handmatig)"
+on7  = input.bool(true, "actief", group = g7, inline = "a7")
+dir7 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g7, inline = "a7")
+hh7  = input.int(2, "start", minval = 0, maxval = 23, group = g7, inline = "b7")
+mm7  = input.int(30, ":", minval = 0, maxval = 59, group = g7, inline = "b7")
+orb7 = input.int(15, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g7, inline = "b7")
+mul7 = input.float(2.5, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g7, inline = "c7")
+vw7  = input.string("Met", "VWAP", options = ["Met","Tegen","Uit"], group = g7, inline = "c7")
+rr7  = input.float(2.0, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g7, inline = "c7")
+ev7  = input.float(15.94, "EV pts (voorrang)", step = 0.01, group = g7, inline = "d7")
+g8 = "Slot 08 (handmatig)"
+on8  = input.bool(true, "actief", group = g8, inline = "a8")
+dir8 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g8, inline = "a8")
+hh8  = input.int(2, "start", minval = 0, maxval = 23, group = g8, inline = "b8")
+mm8  = input.int(30, ":", minval = 0, maxval = 59, group = g8, inline = "b8")
+orb8 = input.int(15, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g8, inline = "b8")
+mul8 = input.float(3.0, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g8, inline = "c8")
+vw8  = input.string("Met", "VWAP", options = ["Met","Tegen","Uit"], group = g8, inline = "c8")
+rr8  = input.float(3.0, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g8, inline = "c8")
+ev8  = input.float(15.72, "EV pts (voorrang)", step = 0.01, group = g8, inline = "d8")
+g9 = "Slot 09 (handmatig)"
+on9  = input.bool(true, "actief", group = g9, inline = "a9")
+dir9 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g9, inline = "a9")
+hh9  = input.int(2, "start", minval = 0, maxval = 23, group = g9, inline = "b9")
+mm9  = input.int(30, ":", minval = 0, maxval = 59, group = g9, inline = "b9")
+orb9 = input.int(20, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g9, inline = "b9")
+mul9 = input.float(1.5, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g9, inline = "c9")
+vw9  = input.string("Met", "VWAP", options = ["Met","Tegen","Uit"], group = g9, inline = "c9")
+rr9  = input.float(3.5, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g9, inline = "c9")
+ev9  = input.float(15.54, "EV pts (voorrang)", step = 0.01, group = g9, inline = "d9")
+g10 = "Slot 10 (handmatig)"
+on10  = input.bool(true, "actief", group = g10, inline = "a10")
+dir10 = input.string("Beide", "", options = ["Beide","Long","Short"], group = g10, inline = "a10")
+hh10  = input.int(8, "start", minval = 0, maxval = 23, group = g10, inline = "b10")
+mm10  = input.int(0, ":", minval = 0, maxval = 59, group = g10, inline = "b10")
+orb10 = input.int(20, "ORB", options = [5,10,15,20,25,30,35,40,45,50,55,60], group = g10, inline = "b10")
+mul10 = input.float(2.5, "SL×", options = [1.0,1.5,2.0,2.5,3.0], group = g10, inline = "c10")
+vw10  = input.string("Met", "VWAP", options = ["Met","Tegen","Uit"], group = g10, inline = "c10")
+rr10  = input.float(1.5, "RR", options = [1.0,1.5,2.0,2.5,3.0,3.5], group = g10, inline = "c10")
+ev10  = input.float(15.33, "EV pts (voorrang)", step = 0.01, group = g10, inline = "d10")
+
+N = 10
+var array<bool>   slOn  = na
+var array<string> slDir = na
+var array<int>    slH   = na
+var array<int>    slM   = na
+var array<int>    slOrb = na
+var array<float>  slMul = na
+var array<string> slVw  = na
+var array<float>  slRR  = na
+var array<float>  slEV  = na
+var array<bool>   slAct = na          // overleeft de (start+ORB)-filter
+
+if barstate.isfirst
+    if preset == "MGC"
+        slOn  := array.from(true, true, true, true, true, true, true, true, true, true)
+        slDir := array.from("Beide","Beide","Beide","Beide","Beide","Beide","Beide","Beide","Beide","Beide")
+        slH   := array.from(2, 16, 16, 16, 7, 2, 2, 2, 2, 8)
+        slM   := array.from(30, 0, 0, 0, 0, 30, 30, 30, 30, 0)
+        slOrb := array.from(15, 30, 30, 25, 25, 15, 15, 15, 20, 20)
+        slMul := array.from(1.5, 2.5, 2.0, 2.0, 2.5, 2.0, 2.5, 3.0, 1.5, 2.5)
+        slVw  := array.from("Met", "Tegen", "Tegen", "Tegen", "Met", "Met", "Met", "Met", "Met", "Met")
+        slRR  := array.from(3.5, 1.0, 1.0, 1.0, 1.5, 2.5, 2.0, 3.0, 3.5, 1.5)
+        slEV  := array.from(18.64, 17.78, 17.38, 16.93, 16.64, 16.36, 15.94, 15.72, 15.54, 15.33)
+    else if preset == "MNQ"
+        slOn  := array.from(true, true, true, true, true, true, true, true, true, true)
+        slDir := array.from("Beide","Beide","Beide","Beide","Beide","Beide","Beide","Beide","Beide","Beide")
+        slH   := array.from(18, 18, 18, 2, 22, 2, 18, 18, 2, 22)
+        slM   := array.from(30, 30, 0, 30, 0, 30, 30, 30, 30, 0)
+        slOrb := array.from(25, 25, 30, 20, 10, 20, 25, 25, 20, 10)
+        slMul := array.from(3.0, 3.0, 2.5, 3.0, 3.0, 2.5, 2.0, 3.0, 2.0, 2.0)
+        slVw  := array.from("Tegen", "Tegen", "Tegen", "Met", "Tegen", "Met", "Tegen", "Tegen", "Met", "Tegen")
+        slRR  := array.from(1.5, 2.0, 2.5, 1.5, 2.5, 2.0, 2.5, 3.0, 2.0, 3.5)
+        slEV  := array.from(125.80, 117.42, 95.35, 94.18, 91.17, 91.04, 89.46, 89.46, 87.90, 86.50)
+    else
+        slOn  := array.from(on1, on2, on3, on4, on5, on6, on7, on8, on9, on10)
+        slDir := array.from(dir1, dir2, dir3, dir4, dir5, dir6, dir7, dir8, dir9, dir10)
+        slH   := array.from(hh1, hh2, hh3, hh4, hh5, hh6, hh7, hh8, hh9, hh10)
+        slM   := array.from(mm1, mm2, mm3, mm4, mm5, mm6, mm7, mm8, mm9, mm10)
+        slOrb := array.from(orb1, orb2, orb3, orb4, orb5, orb6, orb7, orb8, orb9, orb10)
+        slMul := array.from(mul1, mul2, mul3, mul4, mul5, mul6, mul7, mul8, mul9, mul10)
+        slVw  := array.from(vw1, vw2, vw3, vw4, vw5, vw6, vw7, vw8, vw9, vw10)
+        slRR  := array.from(rr1, rr2, rr3, rr4, rr5, rr6, rr7, rr8, rr9, rr10)
+        slEV  := array.from(ev1, ev2, ev3, ev4, ev5, ev6, ev7, ev8, ev9, ev10)
+
+    // ── Eén winnaar per (starttijd + ORB-lengte) ──────────────────────────
+    slAct := array.new<bool>(N, false)
+    for i = 0 to N - 1
+        if array.get(slOn, i)
+            _win = true
+            for k = 0 to N - 1
+                if k != i and array.get(slOn, k)
+                    _zelfde = array.get(slH, k) == array.get(slH, i) and
+                              array.get(slM, k) == array.get(slM, i) and
+                              array.get(slOrb, k) == array.get(slOrb, i)
+                    if _zelfde
+                        _beter = array.get(slEV, k) > array.get(slEV, i) or
+                                 (array.get(slEV, k) == array.get(slEV, i) and k < i)
+                        if _beter
+                            _win := false
+            array.set(slAct, i, _win)
+
+var array<float> sHi  = array.new<float>(N, na)
+var array<float> sLo  = array.new<float>(N, na)
+var array<int>   sSig = array.new<int>(N, 0)
+var array<box>   sBox = array.new<box>(N, na)
+var array<int>   cN   = array.new<int>(N, 0)
+var array<int>   cWin = array.new<int>(N, 0)
+var int tradeNr = 0
+
+type Pos
+    float e
+    float stop
+    float tp
+    int   dir
+    int   slot
+    int   dl
+    line  lSL
+    line  lTP
+var array<Pos> pos = array.new<Pos>()
+
+atr    = ta.atr(atrLen)
+barMin = hour(time, TZ) * 60 + minute(time, TZ)
+newDay = ta.change(time("D")) != 0
+_vwSes = ta.vwap(hlc3)
+_vwDag = ta.vwap(hlc3, newDay)
+vw     = vwAnker == "Sessie" ? _vwSes : _vwDag
+winMin = math.round(winU * 60)
+dec    = syminfo.mintick >= 0.01 ? 2 : 5
+sym    = symOver == "" ? syminfo.ticker : symOver
+
+// Past het preset bij de chart? MGC-regels horen niet op een MNQ-chart.
+_tk = str.upper(syminfo.ticker)
+_isG = str.contains(_tk, "MGC") or str.contains(_tk, "XAU") or str.contains(_tk, "GOLD")
+_isN = str.contains(_tk, "MNQ") or str.contains(_tk, "NQ") or str.contains(_tk, "NAS")
+presetOk = preset == "Handmatig" ? true : preset == "MGC" ? _isG : _isN
+mag = presetOk or not strictSym
+
+if newDay
+    for i = 0 to N - 1
+        array.set(sHi, i, na), array.set(sLo, i, na)
+        array.set(sSig, i, 0), array.set(sBox, i, na)
+
+orders = array.new<string>()
+
+if barstate.isconfirmed and mag
+    for i = 0 to N - 1
+        if array.get(slAct, i)
+            _st = array.get(slH, i) * 60 + array.get(slM, i)
+            _en = _st + array.get(slOrb, i)
+
+            if barMin >= _st and barMin < _en
+                _h = array.get(sHi, i), _l = array.get(sLo, i)
+                array.set(sHi, i, na(_h) ? high : math.max(_h, high))
+                array.set(sLo, i, na(_l) ? low  : math.min(_l, low))
+                if toonBox
+                    _bx = array.get(sBox, i)
+                    if na(_bx)
+                        array.set(sBox, i, box.new(bar_index, high, bar_index, low,
+                             border_color = color.new(color.orange, 35),
+                             bgcolor = color.new(color.orange, 91),
+                             text = "S" + str.tostring(i + 1) + " " + str.tostring(array.get(slOrb, i)) + "m",
+                             text_color = color.new(color.orange, 30), text_size = size.tiny))
+                    else
+                        box.set_right(_bx, bar_index)
+                        box.set_top(_bx, array.get(sHi, i)), box.set_bottom(_bx, array.get(sLo, i))
+
+            if barMin >= _en and barMin < _en + winMin and array.get(sSig, i) == 0
+                _hi = array.get(sHi, i), _lo = array.get(sLo, i)
+                if not na(_hi) and not na(_lo)
+                    _up = close > _hi and close[1] <= _hi
+                    _dn = close < _lo and close[1] >= _lo
+                    if _up or _dn
+                        _lg = _up
+                        _vs = array.get(slVw, i)
+                        _vOk = _vs == "Uit" ? true : _vs == "Met" ? (_lg ? close > vw : close < vw) : (_lg ? close < vw : close > vw)
+                        _dr = array.get(slDir, i)
+                        _dOk = _dr == "Beide" or (_lg and _dr == "Long") or (not _lg and _dr == "Short")
+                        if _vOk and _dOk
+                            _ruw = _lg ? close - _lo : _hi - close
+                            _d   = math.max(math.max(_ruw, atr * minAtrFrac), syminfo.mintick)
+                            _stp = _d * array.get(slMul, i)
+                            _tpd = _stp * array.get(slRR, i)
+                            _slP = _lg ? close - _stp : close + _stp
+                            _tpP = _lg ? close + _tpd : close - _tpd
+                            tradeNr := tradeNr + 1
+                            array.set(sSig, i, 1)
+                            array.set(cN, i, array.get(cN, i) + 1)
+
+                            // Korte stompjes: vaste lengte, niet meegroeien met de trade.
+                            _l1 = toonLijn ? line.new(bar_index, _slP, bar_index + lijnBars, _slP,
+                                 color = color.new(color.red, 10), width = 2) : na
+                            _l2 = toonLijn ? line.new(bar_index, _tpP, bar_index + lijnBars, _tpP,
+                                 color = color.new(color.green, 10), width = 2) : na
+                            if toonLijn
+                                label.new(bar_index + lijnBars, _slP, "SL " + str.tostring(math.round(_slP, dec)),
+                                     style = label.style_none, textcolor = color.new(color.red, 15),
+                                     size = size.tiny)
+                                label.new(bar_index + lijnBars, _tpP, "TP " + str.tostring(math.round(_tpP, dec)),
+                                     style = label.style_none, textcolor = color.new(color.green, 15),
+                                     size = size.tiny)
+
+                            _tip = "Slot " + str.tostring(i + 1) + (_lg ? "  BUY" : "  SELL") +
+                                 "\nstart " + str.format("{0,number,00}:{1,number,00}",
+                                      array.get(slH, i), array.get(slM, i)) +
+                                 "   ORB " + str.tostring(array.get(slOrb, i)) + "m" +
+                                 "\nentry " + str.tostring(math.round(close, dec)) +
+                                 "\nSL " + str.tostring(math.round(_slP, dec)) +
+                                 "  (×" + str.tostring(array.get(slMul, i), "#.#") + ")" +
+                                 "\nTP " + str.tostring(math.round(_tpP, dec)) +
+                                 "  (" + str.tostring(array.get(slRR, i), "#.#") + "R)" +
+                                 "\nVWAP " + _vs
+                            _lb = toonLbl ? label.new(bar_index, _lg ? low : high,
+                                 labelVol ? "S" + str.tostring(i + 1) + (_lg ? " ▲ BUY" : " ▼ SELL") : "",
+                                 style = labelVol ? (_lg ? label.style_label_up : label.style_label_down)
+                                                  : (_lg ? label.style_triangleup : label.style_triangledown),
+                                 color = _lg ? color.new(color.green, 10) : color.new(color.red, 10),
+                                 textcolor = color.white, size = size.tiny, tooltip = _tip) : na
+
+                            array.push(pos, Pos.new(close, _stp, _tpd, _lg ? 1 : 0, i,
+                                 time + houdMin * 60000, _l1, _l2))
+
+                            _id = sym + "-" +
+                                 str.format("{0,number,00}{1,number,00}", array.get(slH, i), array.get(slM, i)) + "-" +
+                                 str.tostring(array.get(slOrb, i)) + "m-x" +
+                                 str.tostring(array.get(slMul, i), "#.#") + "-" +
+                                 str.lower(_vs) + "-" + str.tostring(array.get(slRR, i), "#.#") + "R"
+
+                            array.push(orders,
+                                 '{"action":"'      + (_lg ? "buy" : "sell")                       + '"' +
+                                  ',"symbol":"'     + sym                                          + '"' +
+                                  ',"slot_id":"'    + _id                                          + '"' +
+                                  ',"slot":'        + str.tostring(i + 1)                                +
+                                  ',"trade_no":'    + str.tostring(tradeNr)                              +
+                                  ',"entry":'       + str.tostring(math.round(close, dec))                +
+                                  ',"sl":'          + str.tostring(math.round(_slP, dec))                 +
+                                  ',"sl_points":'   + str.tostring(math.round(_stp, dec))                 +
+                                  ',"tp":'          + str.tostring(math.round(_tpP, dec))                 +
+                                  ',"tp_points":'   + str.tostring(math.round(_tpd, dec))                 +
+                                  ',"rr":'          + str.tostring(array.get(slRR, i), "#.#")             +
+                                  ',"sl_mult":'     + str.tostring(array.get(slMul, i), "#.#")            +
+                                  ',"orb_start":"'  + str.format("{0,number,00}:{1,number,00}",
+                                                         array.get(slH, i), array.get(slM, i))      + '"' +
+                                  ',"orb_minutes":' + str.tostring(array.get(slOrb, i))                   +
+                                  ',"orb_high":'    + str.tostring(math.round(_hi, dec))                  +
+                                  ',"orb_low":'     + str.tostring(math.round(_lo, dec))                  +
+                                  ',"vwap_side":"'  + str.lower(_vs)                               + '"' +
+                                  ',"vwap":'        + str.tostring(math.round(vw, dec))                   +
+                                  ',"risk_pct":'    + str.tostring(riskPct, "#.##")                       +
+                                  ',"expires_at":"' + str.format_time(time + houdMin * 60000,
+                                                         "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")         + '"' +
+                                  '}')
+
+if array.size(pos) > 0
+    for i = array.size(pos) - 1 to 0
+        p   = array.get(pos, i)
+        fav = p.dir == 1 ? high - p.e : p.e - low
+        adv = p.dir == 1 ? p.e - low  : high - p.e
+        _sl = adv >= p.stop
+        _tp = fav >= p.tp
+        if _sl or _tp or time >= p.dl
+            if _tp and not _sl
+                array.set(cWin, p.slot, array.get(cWin, p.slot) + 1)
+                if not na(p.lTP)
+                    line.set_color(p.lTP, color.new(color.green, 0))
+            array.remove(pos, i)
+
+// Waarschuwing als preset en chart niet bij elkaar horen
+if barstate.islast and not presetOk
+    var label _wrn = na
+    label.delete(_wrn)
+    _wrn := label.new(bar_index, high,
+         "⚠  preset " + preset + " op " + syminfo.ticker +
+         (strictSym ? "\nALLES GEBLOKKEERD — geen signalen, geen webhooks"
+                     : "\nfilter staat UIT — er vuren wél signalen") +
+         "\nZet het preset op het juiste symbool.",
+         style = label.style_label_down,
+         color = color.new(color.red, 10), textcolor = color.white, size = size.normal)
+
+if alertsAan and mag and array.size(orders) > 0
+    alert('{"orders":[' + array.join(orders, ",") + ']}', alert.freq_once_per_bar_close)
+
+if barstate.islast and toonTab
+    var table t = table.new(position.bottom_right, 9, N + 2, border_width = 1,
+         frame_color = color.new(color.gray, 40), frame_width = 1)
+    hh = color.new(color.teal, 10)
+    kk = array.from("slot", "start", "ORB", "SL×", "VWAP", "RR", "n", "TP", "WR")
+    for c = 0 to 8
+        table.cell(t, c, 0, array.get(kk, c), text_color = color.white, bgcolor = hh, text_size = size.tiny)
+    _r = 1
+    for i = 0 to N - 1
+        _aan = array.get(slAct, i)
+        if _aan or toonGeblok
+            _tc = _aan ? color.white : color.new(color.gray, 55)
+            _n  = array.get(cN, i)
+            _w  = array.get(cWin, i)
+            table.cell(t, 0, _r, "S" + str.tostring(i + 1) + (_aan ? "" : " ✕"), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 1, _r, str.format("{0,number,00}:{1,number,00}",
+                 array.get(slH, i), array.get(slM, i)), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 2, _r, str.tostring(array.get(slOrb, i)) + "m", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 3, _r, "×" + str.tostring(array.get(slMul, i), "#.#"), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 4, _r, array.get(slVw, i), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 5, _r, str.tostring(array.get(slRR, i), "#.#") + "R", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 6, _r, _aan ? str.tostring(_n) : "—", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 7, _r, _aan ? str.tostring(_w) : "—", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 8, _r, _aan and _n > 0 ? str.tostring(_w / _n * 100, "#") + "%" : "—",
+                 text_color = _tc, text_size = size.tiny)
+            _r := _r + 1
+    if toonGeblok
+        table.cell(t, 0, _r, "✕", text_color = color.gray, text_size = size.tiny)
+        table.cell(t, 1, _r, "geblokkeerd: zelfde start+ORB, lagere EV",
+             text_color = color.orange, text_size = size.tiny)
+        for c = 2 to 8
+            table.cell(t, c, _r, "", text_size = size.tiny)
+
+// ── VWAP zichtbaar maken ──────────────────────────────────────────────────
+// Zonder deze lijn kun je niet controleren of "Met" en "Tegen" doen wat je
+// denkt. De kleur volgt de kant waar de prijs staat: blauw = prijs erboven
+// (een opwaartse breuk telt dan als Met), roze = prijs eronder.
+_vwKleur = close >= vw ? color.new(color.aqua, 0) : color.new(color.fuchsia, 0)
+plot(toonVwap ? vw : na, "VWAP", color = _vwKleur, linewidth = 2)

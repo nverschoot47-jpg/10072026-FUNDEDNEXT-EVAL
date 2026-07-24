@@ -1,0 +1,17 @@
+{
+  "name": "pronto-orb-bridge",
+  "version": "1.0.0",
+  "description": "TradingView PRONTO ORB multi-slot webhook -> MetaApi -> MT5, with full Postgres logging",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "migrate": "node migrate.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "metaapi.cloud-sdk": "^27.6.0",
+    "pg": "^8.12.0"
+  }
+}
