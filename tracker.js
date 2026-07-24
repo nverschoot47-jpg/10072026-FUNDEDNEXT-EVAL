@@ -23,7 +23,7 @@ function reason(order, closePrice) {
 async function sweep() {
   if (!broker.isReady()) return;
 
-  const open = await db.openOrders();
+  const open = await db.openOrders(broker.accountId());
   if (!open.length) return;
 
   const live   = await broker.positions();
