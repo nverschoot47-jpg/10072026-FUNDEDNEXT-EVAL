@@ -218,8 +218,76 @@ app.get('/slots', async (_req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.type('text').send(
-  `PRONTO ORB bridge — firm=${FIRM}\n/health  /slots  POST /webhook?secret=...\n`));
+// ── Dashboard ─────────────────────────────────────────────────────────────
+// Eén pagina, geen build, geen dependencies. Ververst zichzelf elke 15s.
+app.get('/', async (_req, res) => {
+  let health = {}, slots = [], recent = [];
+  try {
+    const { total, n } = await db.openRiskPct();
+    health = { firm: FIRM, label: firmConfig().label, trading: TRADING_ENABLED,
+               broker: broker.isReady(), broker_error: broker.lastError(),
+               account: broker.accountId(), open_positions: n, open_risk_pct: total,
+               risk: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit webhook' };
+    slots  = await db.slotPerformance();
+    recent = (await db.pool.query(
+      `SELECT received_at, slot_id, action, status, reason FROM signals
+        ORDER BY id DESC LIMIT 25`)).rows;
+  } catch (e) { health.error = e.message; }
+
+  const cel = v => v === null || v === undefined ? '<td class="d">—</td>' : `<td>${v}</td>`;
+  const kleur = v => v > 0 ? 'w' : v < 0 ? 'l' : 'd';
+
+  res.type('html').send(`<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PRONTO ORB — ${FIRM}</title>
+<style>
+ body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,monospace;margin:0;padding:14px}
+ h1{font-size:15px;margin:0 0 12px;color:#e6edf3}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:14px}
+ .row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #21262d}
+ .row:last-child{border:0}
+ .k{color:#8b949e}
+ table{width:100%;border-collapse:collapse;font-size:12px}
+ th{text-align:left;color:#8b949e;font-weight:normal;border-bottom:1px solid #30363d;padding:5px 6px}
+ td{padding:5px 6px;border-bottom:1px solid #21262d}
+ .ok{color:#3fb950}.bad{color:#f85149}.w{color:#3fb950}.l{color:#f85149}.d{color:#6e7681}
+ h2{font-size:13px;color:#8b949e;margin:0 0 8px;font-weight:normal}
+ .wrap{overflow-x:auto}
+</style>
+<h1>PRONTO ORB — ${health.label || FIRM}</h1>
+
+<div class="card">
+ <div class="row"><span class="k">broker</span><span class="${health.broker ? 'ok' : 'bad'}">${health.broker ? 'verbonden' : 'GEEN VERBINDING'}</span></div>
+ ${health.broker_error ? `<div class="row"><span class="k">fout</span><span class="bad">${health.broker_error}</span></div>` : ''}
+ <div class="row"><span class="k">handelen</span><span class="${health.trading ? 'ok' : 'd'}">${health.trading ? 'aan' : 'uit (dry run)'}</span></div>
+ <div class="row"><span class="k">account</span><span>${health.account || '—'}</span></div>
+ <div class="row"><span class="k">risico p/trade</span><span>${health.risk}</span></div>
+ <div class="row"><span class="k">open posities</span><span>${health.open_positions ?? 0}</span></div>
+ <div class="row"><span class="k">open risico</span><span>${(health.open_risk_pct ?? 0).toFixed?.(2) ?? 0}%</span></div>
+</div>
+
+<div class="card"><h2>per slot</h2><div class="wrap"><table>
+ <tr><th>slot</th><th>sym</th><th>n</th><th>dicht</th><th>win%</th><th>gem R</th><th>winst</th><th>min</th><th>slip</th></tr>
+ ${slots.length ? slots.map(s => `<tr>
+   <td>${s.slot_id}</td><td>${s.mt5_symbol || '—'}</td>${cel(s.n_orders)}${cel(s.n_closed)}
+   ${cel(s.win_pct)}<td class="${kleur(s.avg_r)}">${s.avg_r ?? '—'}</td>
+   <td class="${kleur(s.total_profit)}">${s.total_profit ?? '—'}</td>${cel(s.avg_minutes)}${cel(s.avg_slippage)}
+ </tr>`).join('') : '<tr><td colspan="9" class="d">nog geen orders</td></tr>'}
+</table></div></div>
+
+<div class="card"><h2>laatste signalen</h2><div class="wrap"><table>
+ <tr><th>tijd</th><th>slot</th><th>kant</th><th>status</th><th>reden</th></tr>
+ ${recent.length ? recent.map(r => `<tr>
+   <td class="d">${new Date(r.received_at).toISOString().slice(5,16).replace('T',' ')}</td>
+   <td>${r.slot_id}</td><td>${r.action || '—'}</td>
+   <td class="${r.status === 'accepted' ? 'ok' : 'bad'}">${r.status}</td>
+   <td class="d">${r.reason || ''}</td>
+ </tr>`).join('') : '<tr><td colspan="5" class="d">nog geen signalen ontvangen</td></tr>'}
+</table></div></div>
+
+<div class="d">JSON: <a style="color:#58a6ff" href="/health">/health</a> · <a style="color:#58a6ff" href="/slots">/slots</a> — ververst elke 15s</div>
+<script>setTimeout(()=>location.reload(),15000)</script>`);
+});
 
 (async () => {
   try {
