@@ -132,11 +132,35 @@ export async function insertOrder(row) {
 
 export async function openOrders(accountId) {
   const r = await pool.query(
-    `SELECT id, slot_id, mt5_symbol, action, volume, fill_price, sl_price, tp_price,
-            sl_points, risk_amount, position_id, placed_at
-       FROM orders
-      WHERE status = 'open' AND position_id IS NOT NULL
-        AND account_id IS NOT DISTINCT FROM $1`, [accountId]);
+    `SELECT o.id, o.slot_id, o.mt5_symbol, o.action, o.volume, o.fill_price, o.sl_price, o.tp_price,
+            o.sl_points, o.risk_amount, o.position_id, o.placed_at, s.orb_start
+       FROM orders o
+       LEFT JOIN signals s ON s.id = o.signal_id
+      WHERE o.status = 'open' AND o.position_id IS NOT NULL
+        AND o.account_id IS NOT DISTINCT FROM $1`, [accountId]);
+  return r.rows;
+}
+
+/**
+ * Volledige trade-feed voor het dashboard: elke order met zijn signaal
+ * (voor sessie/orb-context) en zijn close (als hij al dicht is). Eén rij per
+ * order, ongeacht of hij nog open staat, gesloten is, of mislukt is — het
+ * dashboard filtert/sorteert dit clientside, dus hier gaat alles ruw mee.
+ */
+export async function tradesFeed(limit = 300) {
+  const r = await pool.query(
+    `SELECT o.id, o.placed_at, o.account_id, o.slot_id, o.mt5_symbol, o.action,
+            o.status, o.valid, o.invalid_reason, o.entry_tv, o.fill_price,
+            o.sl_price, o.tp_price, o.volume, o.risk_amount, o.equity_at_open,
+            o.basis_pct, o.error,
+            s.orb_start, s.risk_pct,
+            c.closed_at, c.close_price, c.profit, c.swap, c.commission,
+            c.duration_min, c.r_multiple, c.close_reason
+       FROM orders o
+       LEFT JOIN signals s ON s.id = o.signal_id
+       LEFT JOIN closes  c ON c.order_id = o.id
+      ORDER BY o.placed_at DESC
+      LIMIT $1`, [limit]);
   return r.rows;
 }
 
