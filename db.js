@@ -1,5 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // db.js — Postgres-laag. Alles wat naar de database gaat, gaat hierlangs.
+//
+// Aangepast voor het nieuwe dashboard: tradesFeed() en signalsFeed() geven nu
+// ALLE omgerekende MT5-velden terug die server.js al wegschreef maar die
+// nergens werden uitgelezen. Het handelspad is ongewijzigd.
 // ═══════════════════════════════════════════════════════════════════════════
 import pg from 'pg';
 import fs from 'node:fs';
@@ -15,9 +19,6 @@ export const pool = new pg.Pool({
 });
 
 export async function initSchema() {
-  // Bijhouden wat er al gedraaid heeft. Zonder dit draait élk .sql-bestand bij
-  // iedere herstart opnieuw — meestal onschuldig, maar niet als een latere
-  // migratie een view of kolom herdefinieert. Dan draai je jezelf in een kringetje.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       filename   TEXT PRIMARY KEY,
@@ -62,11 +63,6 @@ export async function logError(context, message, payload = null) {
   console.error(`[${context}] ${message}`);
 }
 
-/**
- * Bouwt een INSERT uit één object. Kolomnamen en waarden komen daardoor uit
- * dezelfde bron en kunnen niet meer uit de pas lopen — precies de fout die
- * eerder een signaal kostte ("24 parameters, prepared statement requires 23").
- */
 function bouwInsert(tabel, obj, extra = '') {
   const cols = Object.keys(obj);
   const ph   = cols.map((_, i) => `$${i + 1}`).join(',');
@@ -76,7 +72,6 @@ function bouwInsert(tabel, obj, extra = '') {
   };
 }
 
-/** Schrijft het signaal weg. Botst het op de dag-index, dan is het een duplicate. */
 export async function insertSignal(firm, o, mt5Symbol, status, reason) {
   const rij = {
     firm,
@@ -110,13 +105,12 @@ export async function insertSignal(firm, o, mt5Symbol, status, reason) {
     const r = await pool.query(q.sql, q.vals);
     return { id: r.rows[0].id, duplicate: false };
   } catch (e) {
-    if (e.code === '23505') {                 // dit slot vuurde vandaag al
+    if (e.code === '23505') {
       const dup = bouwInsert('signals',
         { ...rij, status: 'duplicate', reason: 'slot vuurde vandaag al' });
       await pool.query(dup.sql, dup.vals);
       return { id: null, duplicate: true };
     }
-    // Kolom bestaat nog niet (migratie niet gedraaid)? Log het duidelijk.
     if (e.code === '42703') {
       throw new Error(`kolom ontbreekt in signals — draait migratie 003/004 al? (${e.message})`);
     }
@@ -142,18 +136,39 @@ export async function openOrders(accountId) {
 }
 
 /**
- * Volledige trade-feed voor het dashboard: elke order met zijn signaal
- * (voor sessie/orb-context) en zijn close (als hij al dicht is). Eén rij per
- * order, ongeacht of hij nog open staat, gesloten is, of mislukt is — het
- * dashboard filtert/sorteert dit clientside, dus hier gaat alles ruw mee.
+ * Volledige trade-feed voor het dashboard.
+ *
+ * Geeft per order DRIE werelden naast elkaar terug:
+ *   1. wat TradingView stuurde  (entry_tv, sl_points_tv, orb_high, vwap, ...)
+ *   2. wat er op MT5 gebeurde   (fill_price, sl_price, orb_high_mt5, ...)
+ *   3. de verhouding ertussen   (sl_pct, tp_pct, basis_pct)
+ *
+ * Het dashboard rekent daaruit alles om naar % van de MT5-entry. Dat kan
+ * clientside omdat alle ingrediënten in de rij zitten — geen extra query's.
  */
 export async function tradesFeed(limit = 300) {
   const r = await pool.query(
     `SELECT o.id, o.placed_at, o.account_id, o.slot_id, o.mt5_symbol, o.action,
-            o.status, o.valid, o.invalid_reason, o.entry_tv, o.fill_price,
-            o.sl_price, o.tp_price, o.volume, o.risk_amount, o.equity_at_open,
-            o.basis_pct, o.error,
-            s.orb_start, s.risk_pct,
+            o.status, o.valid, o.invalid_reason, o.error, o.position_id,
+            o.volume, o.risk_amount, o.equity_at_open, o.slippage,
+
+            -- TradingView-wereld (futures)
+            o.entry_tv, o.sl_points_tv, o.tp_points_tv,
+
+            -- MT5-wereld (CFD)
+            o.fill_price, o.sl_price, o.tp_price, o.sl_points, o.tp_points,
+            o.orb_high_mt5, o.orb_low_mt5, o.vwap_mt5,
+
+            -- verhouding tussen beide
+            o.basis, o.basis_pct, o.sl_pct, o.tp_pct,
+
+            -- signaalcontext, ruw zoals PineScript hem stuurde
+            s.received_at, s.tv_symbol, s.slot AS slot_nr, s.trade_no,
+            s.rr, s.sl_mult, s.orb_start, s.orb_minutes,
+            s.orb_high, s.orb_low, s.vwap, s.vwap_side,
+            s.risk_pct, s.expires_at, s.status AS signal_status, s.reason AS signal_reason,
+
+            -- uitkomst
             c.closed_at, c.close_price, c.profit, c.swap, c.commission,
             c.duration_min, c.r_multiple, c.close_reason
        FROM orders o
@@ -161,6 +176,32 @@ export async function tradesFeed(limit = 300) {
        LEFT JOIN closes  c ON c.order_id = o.id
       ORDER BY o.placed_at DESC
       LIMIT $1`, [limit]);
+  return r.rows;
+}
+
+/**
+ * Signaal-log: élk binnengekomen signaal, ook geweigerde en duplicaten.
+ * Dit is de enige plek waar je ziet WAAROM er niets geplaatst is.
+ */
+export async function signalsFeed(limit = 200) {
+  const r = await pool.query(
+    `SELECT s.id, s.received_at, s.trade_date, s.slot_id, s.slot AS slot_nr, s.trade_no,
+            s.action, s.tv_symbol, s.mt5_symbol, s.status, s.reason,
+            s.entry_tv, s.sl_points, s.tp_points, s.sl_pct, s.tp_pct,
+            s.rr, s.sl_mult, s.orb_start, s.orb_minutes, s.orb_high, s.orb_low,
+            s.vwap, s.vwap_side, s.risk_pct, s.expires_at, s.account_id,
+            o.id AS order_id, o.fill_price
+       FROM signals s
+       LEFT JOIN orders o ON o.signal_id = s.id
+      ORDER BY s.id DESC
+      LIMIT $1`, [limit]);
+  return r.rows;
+}
+
+/** Laatste fouten uit de errors-tabel, voor het systeemtabblad. */
+export async function recentErrors(limit = 40) {
+  const r = await pool.query(
+    'SELECT id, at, context, message FROM errors ORDER BY id DESC LIMIT $1', [limit]);
   return r.rows;
 }
 
@@ -192,6 +233,25 @@ export async function openRiskPct() {
   return { total: parseFloat(r.rows[0].total), n: parseInt(r.rows[0].n, 10) };
 }
 
+/**
+ * Basisdrift per symbool. Dit is de meting die laat zien of je futures->CFD
+ * omrekening stabiel is — en, als je op vertraagde data draait, hoeveel ruis
+ * die vertraging in de entry zet.
+ */
+export async function basisDrift() {
+  const r = await pool.query(
+    `SELECT mt5_symbol,
+            COUNT(*)::int                            AS n,
+            ROUND(AVG(basis_pct) * 100, 4)           AS gem_basis_pct,
+            ROUND(MIN(basis_pct) * 100, 4)           AS min_basis_pct,
+            ROUND(MAX(basis_pct) * 100, 4)           AS max_basis_pct,
+            ROUND(STDDEV_SAMP(basis_pct) * 100, 4)   AS sd_basis_pct
+       FROM orders
+      WHERE basis_pct IS NOT NULL
+      GROUP BY mt5_symbol`);
+  return r.rows;
+}
+
 export async function markMilestone(orderId, slotId, rLevel, price, minutes) {
   await pool.query(
     `INSERT INTO milestones (order_id, slot_id, r_level, price, minutes)
@@ -205,34 +265,6 @@ export async function milestonesFor(orderId) {
   return new Set(r.rows.map(x => parseFloat(x.r_level)));
 }
 
-export async function startGhost(g) {
-  await pool.query(
-    `INSERT INTO ghosts (order_id, slot_id, mt5_symbol, direction, entry,
-        sl_price, sl_points, tp_points, peak_price, peak_r, peak_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
-     ON CONFLICT (order_id) DO NOTHING`,
-    [g.order_id, g.slot_id, g.mt5_symbol, g.direction, g.entry,
-     g.sl_price, g.sl_points, g.tp_points, g.peak_price, g.peak_r]);
-}
-
-export async function openGhosts() {
-  const r = await pool.query('SELECT * FROM ghosts WHERE ended_at IS NULL');
-  return r.rows;
-}
-
-export async function updateGhost(id, peakPrice, peakR) {
-  await pool.query(
-    `UPDATE ghosts SET peak_price = $2, peak_r = $3, peak_at = now()
-      WHERE id = $1 AND ($3 > peak_r OR peak_r IS NULL)`, [id, peakPrice, peakR]);
-}
-
-export async function endGhost(id, reason, realisedR) {
-  await pool.query(
-    `UPDATE ghosts SET ended_at = now(), end_reason = $2,
-            extra_r = GREATEST(COALESCE(peak_r,0) - $3, 0) WHERE id = $1`,
-    [id, reason, realisedR ?? 0]);
-}
-
 export async function markInvalid(orderId, reason) {
   await pool.query('UPDATE orders SET valid = false, invalid_reason = $2 WHERE id = $1',
     [orderId, reason]);
@@ -240,10 +272,5 @@ export async function markInvalid(orderId, reason) {
 
 export async function slotPerformance() {
   const r = await pool.query('SELECT * FROM slot_performance');
-  return r.rows;
-}
-
-export async function ghostSummary() {
-  const r = await pool.query('SELECT * FROM ghost_summary');
   return r.rows;
 }
