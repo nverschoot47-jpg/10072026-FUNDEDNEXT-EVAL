@@ -265,6 +265,56 @@ app.get('/slots', async (_req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Telegram-watcher voedingsbron ────────────────────────────────────────
+// Het aparte telegram-watcher-project polt dit elke paar seconden en stuurt
+// een bericht zodra er een positionId verschijnt dat het nog niet kende.
+// We combineren de LIVE posities van MetaApi (voor de werkelijke fill/SL/TP,
+// die kan afwijken als iemand handmatig heeft aangepast) met onze eigen
+// `orders`-rij op position_id (voor risk_amount en sessie — dat kent MetaApi
+// niet). Onbekend blijft dan gewoon null in plaats van de hele call te laten
+// mislukken; de watcher stuurt liever een onvolledig bericht dan geen bericht.
+app.get('/api/open-positions', async (_req, res) => {
+  if (!broker.isReady()) return res.status(503).json({ error: 'broker niet verbonden' });
+  try {
+    const [live, orders] = await Promise.all([
+      broker.positions(),
+      db.openOrders(broker.accountId()),
+    ]);
+    const byPos = new Map(orders.map(o => [String(o.position_id), o]));
+    const out = live.map(p => {
+      const o = byPos.get(String(p.id));
+      const symbol = p.symbol || o?.mt5_symbol || '';
+      return {
+        positionId: p.id,
+        symbol,
+        direction:  p.type === 'POSITION_TYPE_BUY' ? 'buy' : 'sell',
+        entry:      p.openPrice,
+        sl:         p.stopLoss   ?? (o ? Number(o.sl_price) : null),
+        tp:         p.takeProfit ?? (o ? Number(o.tp_price) : null),
+        lots:       p.volume,
+        riskEur:    o ? Number(o.risk_amount) : null,
+        assetType:  /NDX|US100|NAS/i.test(symbol) ? 'index' : 'fx',
+        session:    o?.orb_start || null,
+        dailyLabel: o?.slot_id || null,
+      };
+    });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Ruwe voeding voor het dashboard — één rij per order, met signaal- en
+// close-context erbij gejoined. Het dashboard filtert/sorteert dit clientside.
+app.get('/api/trades', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 300, 1000);
+    res.json(await db.tradesFeed(limit));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Dashboard ─────────────────────────────────────────────────────────────
 // Eén pagina, geen build, geen dependencies. Ververst zichzelf elke 15s.
 app.get('/', async (_req, res) => {
@@ -279,11 +329,91 @@ app.get('/', async (_req, res) => {
     health.breaker = await guard.status();
     recent = (await db.pool.query(
       `SELECT received_at, slot_id, action, status, reason FROM signals
-        ORDER BY id DESC LIMIT 25`)).rows;
+        ORDER BY id DESC LIMIT 40`)).rows;
   } catch (e) { health.error = e.message; }
 
   const cel = v => v === null || v === undefined ? '<td class="d">—</td>' : `<td>${v}</td>`;
   const kleur = v => v > 0 ? 'w' : v < 0 ? 'l' : 'd';
+
+  // Het clientside script zit hier bewust ZONDER template-literals (alleen
+  // string-concatenatie met + en '') — dit hele blok leeft binnen de outer
+  // JS-template-literal van res.send(), en een backtick hierin zou die
+  // buitenste literal breken. Simpeler om ze gewoon niet te gebruiken.
+  const clientScript = [
+    "var state = { rows: [], sortKey: 'placed_at', sortDir: 'desc', symbol: '', status: '', validOnly: '' };",
+    "function fmtNum(v, d) { if (v === null || v === undefined) return '\u2014'; var n = Number(v); return isNaN(n) ? '\u2014' : n.toFixed(d === undefined ? 2 : d); }",
+    "function fmtTime(s) { if (!s) return '\u2014'; return new Date(s).toISOString().slice(5, 16).replace('T', ' '); }",
+    "function rColor(v) { if (v === null || v === undefined) return 'd'; return v > 0 ? 'w' : (v < 0 ? 'l' : 'd'); }",
+    "function statusOf(row) { if (row.closed_at) return 'closed'; return row.status || 'open'; }",
+    "function populateFilters() {",
+    "  var symbols = Array.from(new Set(state.rows.map(function (r) { return r.mt5_symbol; }).filter(Boolean))).sort();",
+    "  var sel = document.getElementById('fSymbol');",
+    "  if (sel.options.length <= 1) { symbols.forEach(function (s) { var o = document.createElement('option'); o.value = s; o.textContent = s; sel.appendChild(o); }); }",
+    "}",
+    "function filteredSorted() {",
+    "  var rows = state.rows.filter(function (r) {",
+    "    if (state.symbol && r.mt5_symbol !== state.symbol) return false;",
+    "    if (state.status && statusOf(r) !== state.status) return false;",
+    "    if (state.validOnly === 'valid' && r.valid === false) return false;",
+    "    if (state.validOnly === 'invalid' && r.valid !== false) return false;",
+    "    return true;",
+    "  });",
+    "  rows.sort(function (a, b) {",
+    "    var k = state.sortKey, dir = state.sortDir === 'asc' ? 1 : -1;",
+    "    var av = a[k], bv = b[k];",
+    "    if (av === null || av === undefined) av = -Infinity;",
+    "    if (bv === null || bv === undefined) bv = -Infinity;",
+    "    if (k === 'placed_at') { av = new Date(a[k]).getTime(); bv = new Date(b[k]).getTime(); }",
+    "    if (av < bv) return -1 * dir;",
+    "    if (av > bv) return 1 * dir;",
+    "    return 0;",
+    "  });",
+    "  return rows;",
+    "}",
+    "function render() {",
+    "  var rows = filteredSorted();",
+    "  document.getElementById('tradeCount').textContent = rows.length + ' / ' + state.rows.length;",
+    "  var html = rows.map(function (r) {",
+    "    var st = statusOf(r);",
+    "    var stClass = st === 'closed' ? (r.profit > 0 ? 'w' : (r.profit < 0 ? 'l' : 'd')) : (st === 'failed' ? 'bad' : (st === 'open' ? 'ok' : 'd'));",
+    "    return '<tr>' +",
+    "      '<td class=\"d\">' + fmtTime(r.placed_at) + '</td>' +",
+    "      '<td>' + (r.slot_id || '\u2014') + '</td>' +",
+    "      '<td>' + (r.mt5_symbol || '\u2014') + '</td>' +",
+    "      '<td class=\"' + (r.action === 'buy' ? 'w' : 'l') + '\">' + (r.action || '\u2014').toUpperCase() + '</td>' +",
+    "      '<td class=\"' + stClass + '\">' + st + '</td>' +",
+    "      '<td class=\"' + (r.valid === false ? 'bad' : 'ok') + '\" title=\"' + (r.invalid_reason || '') + '\">' + (r.valid === false ? 'nee' : 'ja') + '</td>' +",
+    "      '<td>' + fmtNum(r.fill_price, 5) + '</td>' +",
+    "      '<td>' + fmtNum(r.volume, 2) + '</td>' +",
+    "      '<td>' + fmtNum(r.risk_amount, 2) + '</td>' +",
+    "      '<td class=\"' + rColor(r.r_multiple) + '\">' + (r.r_multiple != null ? fmtNum(r.r_multiple, 2) + 'R' : '\u2014') + '</td>' +",
+    "      '<td class=\"' + rColor(r.profit) + '\">' + fmtNum(r.profit, 2) + '</td>' +",
+    "      '<td>' + (r.duration_min != null ? r.duration_min + 'm' : '\u2014') + '</td>' +",
+    "      '<td class=\"d\">' + (r.close_reason || r.invalid_reason || r.error || '') + '</td>' +",
+    "      '</tr>';",
+    "  }).join('');",
+    "  document.getElementById('tradesBody').innerHTML = html || '<tr><td colspan=\"13\" class=\"d\">geen trades</td></tr>';",
+    "}",
+    "function loadTrades() {",
+    "  fetch('/api/trades').then(function (r) { return r.json(); }).then(function (rows) {",
+    "    state.rows = rows; populateFilters(); render();",
+    "  }).catch(function (e) {",
+    "    document.getElementById('tradesBody').innerHTML = '<tr><td colspan=\"13\" class=\"bad\">kon /api/trades niet laden: ' + e.message + '</td></tr>';",
+    "  });",
+    "}",
+    "document.querySelectorAll('th[data-sort]').forEach(function (th) {",
+    "  th.addEventListener('click', function () {",
+    "    var k = th.getAttribute('data-sort');",
+    "    if (state.sortKey === k) state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc'; else { state.sortKey = k; state.sortDir = 'desc'; }",
+    "    render();",
+    "  });",
+    "});",
+    "document.getElementById('fSymbol').addEventListener('change', function (e) { state.symbol = e.target.value; render(); });",
+    "document.getElementById('fStatus').addEventListener('change', function (e) { state.status = e.target.value; render(); });",
+    "document.getElementById('fValid').addEventListener('change', function (e) { state.validOnly = e.target.value; render(); });",
+    "loadTrades();",
+    "setInterval(loadTrades, 15000);",
+  ].join('\n');
 
   res.type('html').send(`<!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -296,11 +426,15 @@ app.get('/', async (_req, res) => {
  .row:last-child{border:0}
  .k{color:#8b949e}
  table{width:100%;border-collapse:collapse;font-size:12px}
- th{text-align:left;color:#8b949e;font-weight:normal;border-bottom:1px solid #30363d;padding:5px 6px}
- td{padding:5px 6px;border-bottom:1px solid #21262d}
+ th{text-align:left;color:#8b949e;font-weight:normal;border-bottom:1px solid #30363d;padding:5px 6px;white-space:nowrap}
+ th[data-sort]{cursor:pointer;user-select:none}
+ th[data-sort]:hover{color:#e6edf3}
+ td{padding:5px 6px;border-bottom:1px solid #21262d;white-space:nowrap}
  .ok{color:#3fb950}.bad{color:#f85149}.w{color:#3fb950}.l{color:#f85149}.d{color:#6e7681}
  h2{font-size:13px;color:#8b949e;margin:0 0 8px;font-weight:normal}
  .wrap{overflow-x:auto}
+ .filters{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+ select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font:12px ui-monospace,Menlo,monospace}
 </style>
 <h1>PRONTO ORB — ${health.label || FIRM}</h1>
 
@@ -324,7 +458,44 @@ app.get('/', async (_req, res) => {
  </tr>`).join('') : '<tr><td colspan="9" class="d">nog geen orders</td></tr>'}
 </table></div></div>
 
-<div class="card"><h2>laatste signalen</h2><div class="wrap"><table>
+<div class="card">
+ <h2>trades</h2>
+ <div class="filters">
+   <select id="fSymbol"><option value="">alle symbolen</option></select>
+   <select id="fStatus">
+     <option value="">alle status</option>
+     <option value="open">open</option>
+     <option value="closed">closed</option>
+     <option value="failed">failed</option>
+   </select>
+   <select id="fValid">
+     <option value="">valid + invalid</option>
+     <option value="valid">alleen valid</option>
+     <option value="invalid">alleen invalid</option>
+   </select>
+   <span class="d" id="tradeCount"></span>
+ </div>
+ <div class="wrap"><table>
+  <thead><tr>
+   <th data-sort="placed_at">tijd ⇅</th>
+   <th data-sort="slot_id">slot ⇅</th>
+   <th data-sort="mt5_symbol">sym ⇅</th>
+   <th>kant</th>
+   <th>status</th>
+   <th>valid</th>
+   <th data-sort="fill_price">fill ⇅</th>
+   <th data-sort="volume">lots ⇅</th>
+   <th data-sort="risk_amount">risk ⇅</th>
+   <th data-sort="r_multiple">R ⇅</th>
+   <th data-sort="profit">winst ⇅</th>
+   <th data-sort="duration_min">duur ⇅</th>
+   <th>reden</th>
+  </tr></thead>
+  <tbody id="tradesBody"><tr><td colspan="13" class="d">laden…</td></tr></tbody>
+ </table></div>
+</div>
+
+<div class="card"><h2>laatste signalen (ruwe webhook-log)</h2><div class="wrap"><table>
  <tr><th>tijd</th><th>slot</th><th>kant</th><th>status</th><th>reden</th></tr>
  ${recent.length ? recent.map(r => `<tr>
    <td class="d">${new Date(r.received_at).toISOString().slice(5,16).replace('T',' ')}</td>
@@ -334,8 +505,8 @@ app.get('/', async (_req, res) => {
  </tr>`).join('') : '<tr><td colspan="5" class="d">nog geen signalen ontvangen</td></tr>'}
 </table></div></div>
 
-<div class="d">JSON: <a style="color:#58a6ff" href="/health">/health</a> · <a style="color:#58a6ff" href="/slots">/slots</a> — ververst elke 15s</div>
-<script>setTimeout(()=>location.reload(),15000)</script>`);
+<div class="d">JSON: <a style="color:#58a6ff" href="/health">/health</a> · <a style="color:#58a6ff" href="/slots">/slots</a> · <a style="color:#58a6ff" href="/api/trades">/api/trades</a> · <a style="color:#58a6ff" href="/api/open-positions">/api/open-positions</a></div>
+<script>${clientScript}</script>`);
 });
 
 (async () => {
