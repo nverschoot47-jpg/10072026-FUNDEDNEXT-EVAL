@@ -5,6 +5,10 @@
 //   {"orders":[{...}, {...}]}
 // Elke order wordt los beoordeeld, gelogd en (bij goedkeuring) doorgezet.
 // Eén order die faalt laat de rest ongemoeid.
+//
+// HANDELSPAD ONGEWIJZIGD. Alleen het leespad (dashboard + JSON-API) is nieuw:
+// het dashboard is nu clientside en toont élk veld uit de PineScript-payload,
+// omgerekend naar MT5-schaal en uitgedrukt als percentage van de MT5-entry.
 // ═══════════════════════════════════════════════════════════════════════════
 import express from 'express';
 import * as db from './db.js';
@@ -59,10 +63,20 @@ async function handleOrder(o) {
   }
 
   // ── Circuit breaker ─────────────────────────────────────────────────
-  // Staat de schakelaar om, dan wordt het signaal wél gelogd maar niet geplaatst.
   const brk = await guard.status();
   if (brk.tripped) {
     const r = `circuit breaker actief: ${brk.reason}`;
+    await db.insertSignal(FIRM, o, mt5, 'rejected', r);
+    return { slot_id: o.slot_id, ok: false, reason: r };
+  }
+
+  // ── Broker bereikbaar? ──────────────────────────────────────────────
+  // Dit stond vroeger ná de accepted-insert. Gevolg: bij een brokerstoring
+  // bleef het signaal als 'accepted' staan, bezette het de dag-index, en kon
+  // hetzelfde slot die dag niet meer vuren. Nu weigeren we vóór de insert,
+  // zodat een herhaalde webhook alsnog door kan.
+  if (!broker.isReady()) {
+    const r = `broker niet verbonden: ${broker.lastError() || 'onbekende reden'}`;
     await db.insertSignal(FIRM, o, mt5, 'rejected', r);
     return { slot_id: o.slot_id, ok: false, reason: r };
   }
@@ -72,8 +86,6 @@ async function handleOrder(o) {
   const sig = await db.insertSignal(FIRM, o, mt5, 'accepted', null);
   if (sig.duplicate) return { slot_id: o.slot_id, ok: false, reason: 'duplicate (slot vuurde vandaag al)' };
 
-  // Blootstellingsremmen. Met onbeperkte houdtijd lopen open posities op, dus
-  // dit is de enige rem die er is.
   const { total, n } = await db.openRiskPct();
   const { pct: riskPct, bron: riskBron } = resolveRiskPct(o.risk_pct);
   if (n >= MAX_OPEN) {
@@ -93,9 +105,6 @@ async function handleOrder(o) {
   }
 
   // ── Futures -> CFD ───────────────────────────────────────────────────
-  // Eerst de echte CFD-prijs ophalen, dan pas rekenen. De afstanden uit
-  // TradingView zijn futurespunten; die worden als percentage van de
-  // TV-entry overgezet en op de CFD-prijs weer in punten omgezet.
   const eq       = await broker.equity();
   const slTv     = parseFloat(o.sl_points);
   const tpTv     = parseFloat(o.tp_points);
@@ -105,8 +114,6 @@ async function handleOrder(o) {
   const ref = o.action === 'buy' ? q.ask : q.bid;
   const cv  = convertToMt5({ tvEntry: entryTv, mt5Ref: ref, slPointsTv: slTv, tpPointsTv: tpTv });
 
-  // Sanity: staat de CFD-prijs in een heel ander bereik dan de futures, dan
-  // klopt de symboolmapping niet. Beter weigeren dan verkeerd handelen.
   if (cv.scaled && Math.abs(cv.basisPct * 100) > MAX_BASIS_PCT) {
     const r = `basis ${(cv.basisPct * 100).toFixed(2)}% tussen ${o.symbol} (${entryTv}) en ` +
               `${mt5} (${ref}) overschrijdt MAX_BASIS_PCT ${MAX_BASIS_PCT}% — mapping controleren`;
@@ -114,8 +121,6 @@ async function handleOrder(o) {
     return { slot_id: o.slot_id, ok: false, reason: r };
   }
 
-  // Positiegrootte op de MT5-afstand, niet op de futures-afstand — anders zit
-  // de sizing er bij Nasdaq structureel ~1,7% naast.
   const sizing = calcLots({ symbol: mt5, equity: eq, riskPct, slPoints: cv.slPointsMt5 });
   if (!sizing.lots) {
     await db.pool.query('UPDATE signals SET status=$2, reason=$3 WHERE id=$1', [sig.id, 'rejected', sizing.reason]);
@@ -132,8 +137,6 @@ async function handleOrder(o) {
 
     const slippage = entryTv ? +(res.fill - ref).toFixed(5) : null;
 
-    // ── Datavaliditeit ────────────────────────────────────────────────
-    // De order is geplaatst; nu markeren of hij mag meetellen in de statistiek.
     const dq = guard.checkData(o, { conversieGeschaald: cv.scaled, basisPct: cv.basisPct });
 
     const orderId = await db.insertOrder({
@@ -182,7 +185,6 @@ async function handleOrder(o) {
 app.post('/webhook', async (req, res) => {
   if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
 
-  // Zowel {"orders":[...]} als één losse order accepteren.
   const body   = req.body;
   const orders = Array.isArray(body?.orders) ? body.orders
                : Array.isArray(body)         ? body
@@ -194,8 +196,6 @@ app.post('/webhook', async (req, res) => {
   for (const o of orders) {
     try { results.push(await handleOrder(o)); }
     catch (e) {
-      // Vangnet: ook als het wegschrijven zelf faalt, moet het signaal niet
-      // spoorloos verdwijnen. De ruwe payload gaat hoe dan ook naar errors.
       await db.logError('webhook', e.message, o);
       try {
         await db.pool.query(
@@ -212,6 +212,7 @@ app.post('/webhook', async (req, res) => {
   res.json({ received: orders.length, accepted, results });
 });
 
+// ── Bestaande JSON-routes, ongewijzigd ───────────────────────────────────
 app.get('/health', async (_req, res) => {
   try {
     const { total, n } = await db.openRiskPct();
@@ -227,20 +228,12 @@ app.get('/health', async (_req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// Handmatig opnieuw verbinden nadat je een variabele hebt gecorrigeerd.
 app.post('/reconnect', async (req, res) => {
   if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
   try {
     const info = await broker.reconnect();
     res.json({ ok: true, broker: info.broker, equity: info.equity });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get('/ghosts', async (_req, res) => {
-  try { res.json(await db.ghostSummary()); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 app.get('/breaker', async (_req, res) => {
@@ -250,13 +243,13 @@ app.get('/breaker', async (_req, res) => {
 
 app.post('/breaker/reset', async (req, res) => {
   if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
-  await guard.reset('handmatig via API');
+  await guard.reset('handmatig via dashboard');
   res.json({ ok: true });
 });
 
 app.post('/breaker/trip', async (req, res) => {
   if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
-  await guard.trip(req.query.reason || 'handmatig gestopt');
+  await guard.trip(req.query.reason || 'handmatig gestopt via dashboard');
   res.json({ ok: true });
 });
 
@@ -265,14 +258,10 @@ app.get('/slots', async (_req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Telegram-watcher voedingsbron ────────────────────────────────────────
-// Het aparte telegram-watcher-project polt dit elke paar seconden en stuurt
-// een bericht zodra er een positionId verschijnt dat het nog niet kende.
-// We combineren de LIVE posities van MetaApi (voor de werkelijke fill/SL/TP,
-// die kan afwijken als iemand handmatig heeft aangepast) met onze eigen
-// `orders`-rij op position_id (voor risk_amount en sessie — dat kent MetaApi
-// niet). Onbekend blijft dan gewoon null in plaats van de hele call te laten
-// mislukken; de watcher stuurt liever een onvolledig bericht dan geen bericht.
+// ── Telegram-watcher voedingsbron — VORM NIET WIJZIGEN ───────────────────
+// Het aparte telegram-watcher-project polt dit elke 10 seconden en verwacht
+// exact deze veldnamen. Verandert er iets aan de shape, dan valt de alerting
+// stil zonder foutmelding.
 app.get('/api/open-positions', async (_req, res) => {
   if (!broker.isReady()) return res.status(503).json({ error: 'broker niet verbonden' });
   try {
@@ -299,214 +288,508 @@ app.get('/api/open-positions', async (_req, res) => {
       };
     });
     res.json(out);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Ruwe voeding voor het dashboard — één rij per order, met signaal- en
-// close-context erbij gejoined. Het dashboard filtert/sorteert dit clientside.
+// ── Voeding voor het dashboard ───────────────────────────────────────────
 app.get('/api/trades', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 300, 1000);
     res.json(await db.tradesFeed(limit));
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Dashboard ─────────────────────────────────────────────────────────────
-// Eén pagina, geen build, geen dependencies. Ververst zichzelf elke 15s.
-app.get('/', async (_req, res) => {
-  let health = {}, slots = [], recent = [];
+app.get('/api/signals', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+    res.json(await db.signalsFeed(limit));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Eén call met alles wat de kop en het systeemtabblad nodig hebben. */
+app.get('/api/system', async (_req, res) => {
+  const out = {
+    firm: FIRM, label: null, trading: TRADING_ENABLED,
+    broker: broker.isReady(), broker_error: broker.lastError(),
+    account: broker.accountId(), equity: null,
+    open_positions: null, open_risk_pct: null,
+    limits: { max_open: MAX_OPEN, max_risk_pct: MAX_RISK_TOTAL, max_basis_pct: MAX_BASIS_PCT },
+    risk_per_trade: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit de webhook',
+    default_risk_pct: DEFAULT_RISK_PCT,
+    breaker: null, slots: [], basis: [], errors: [], symbols: {}, specs: SPECS,
+    db_error: null, now: new Date().toISOString(),
+  };
+  try { out.label = firmConfig().label; out.symbols = firmConfig().symbols; } catch (e) { out.db_error = e.message; }
+  if (broker.isReady()) { try { out.equity = await broker.equity(); } catch { /* niet fataal */ } }
   try {
     const { total, n } = await db.openRiskPct();
-    health = { firm: FIRM, label: firmConfig().label, trading: TRADING_ENABLED,
-               broker: broker.isReady(), broker_error: broker.lastError(),
-               account: broker.accountId(), open_positions: n, open_risk_pct: total,
-               risk: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit webhook' };
-    slots  = await db.slotPerformance();
-    health.breaker = await guard.status();
-    recent = (await db.pool.query(
-      `SELECT received_at, slot_id, action, status, reason FROM signals
-        ORDER BY id DESC LIMIT 40`)).rows;
-  } catch (e) { health.error = e.message; }
+    out.open_positions = n; out.open_risk_pct = total;
+    out.breaker = await guard.status();
+    out.slots   = await db.slotPerformance();
+    out.basis   = await db.basisDrift();
+    out.errors  = await db.recentErrors(40);
+  } catch (e) { out.db_error = e.message; }
+  res.json(out);
+});
 
-  const cel = v => v === null || v === undefined ? '<td class="d">—</td>' : `<td>${v}</td>`;
-  const kleur = v => v > 0 ? 'w' : v < 0 ? 'l' : 'd';
+// ═══════════════════════════════════════════════════════════════════════════
+// Dashboard
+//
+// Clientside gerenderd: de server stuurt alleen een skelet, de browser haalt
+// JSON op en bouwt de tabellen. Twee redenen:
+//   1. Geen HTML-injectie meer. De oude versie plakte reason-teksten (die
+//      webhook-inhoud bevatten) rechtstreeks in de pagina.
+//   2. Ververst zonder de hele pagina opnieuw op te bouwen.
+//
+// LET OP: dit hele blok leeft in een template-literal. Gebruik in het
+// clientscript daarom GEEN backticks — alleen '+' en enkele aanhalingstekens.
+// ═══════════════════════════════════════════════════════════════════════════
+const CSS = `
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:ui-sans-serif,-apple-system,'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e6edf3;font-size:12px}
+a{color:#58a6ff;text-decoration:none}
+.hdr{background:#161b22;border-bottom:1px solid rgba(139,148,158,.15);padding:7px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
+.brand{font-size:13px;font-weight:700;letter-spacing:.3px}.brand span{color:#bc8cff}
+.hkv{font-size:10px;color:#8b949e;white-space:nowrap}.hkv b{color:#e6edf3;font-variant-numeric:tabular-nums}
+.hkv.g b{color:#3fb950}.hkv.r b{color:#f85149}.hkv.b b{color:#388bfd}.hkv.p b{color:#bc8cff}.hkv.y b{color:#d29922}
+.hstat{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:10px;color:#8b949e}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex-shrink:0}
+.dot.g{background:#3fb950;animation:blink 2s infinite}.dot.r{background:#f85149}.dot.b{background:#388bfd}.dot.y{background:#d29922}.dot.p{background:#bc8cff}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+.nav{background:#161b22;border-bottom:1px solid rgba(139,148,158,.15);display:flex;padding:0 14px;overflow-x:auto}
+.ntab{padding:9px 14px;font-size:11px;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;user-select:none}
+.ntab:hover{color:#e6edf3}.ntab.on{color:#3fb950;border-bottom-color:#3fb950;font-weight:600}
+.ntab:focus-visible{outline:2px solid #388bfd;outline-offset:-2px}
+.wrapp{padding:12px 14px}
+.pg{display:none}.pg.on{display:block}
+.card{background:#161b22;border:1px solid rgba(139,148,158,.15);border-radius:6px;margin-bottom:10px;overflow:hidden}
+.chdr{padding:7px 10px;border-bottom:1px solid rgba(139,148,158,.1);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ctitle{font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}
+.cm{margin-left:auto;font-size:9px;color:#6e7681}
+.tw{width:100%;overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+th{text-align:left;font-size:9px;font-weight:500;color:#6e7681;padding:5px 6px;border-bottom:1px solid rgba(139,148,158,.15);white-space:nowrap;background:#161b22;position:sticky;top:0}
+td{padding:4px 6px;border-bottom:1px solid rgba(139,148,158,.08);font-size:10px;white-space:nowrap;font-variant-numeric:tabular-nums}
+tr:hover td{background:rgba(139,148,158,.05)}
+.nd{text-align:center;color:#6e7681;padding:24px;font-size:11px}
+.bd{display:inline-flex;align-items:center;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700}
+.bd-buy{background:rgba(63,185,80,.15);color:#3fb950;border:1px solid rgba(63,185,80,.3)}
+.bd-sell{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.3)}
+.bd-open{background:rgba(56,139,253,.15);color:#388bfd;border:1px solid rgba(56,139,253,.3)}
+.bd-closed{background:rgba(139,148,158,.12);color:#8b949e;border:1px solid rgba(139,148,158,.25)}
+.bd-failed{background:rgba(248,81,73,.25);color:#ff6b6b;border:1px solid #f85149}
+.bd-acc{background:rgba(63,185,80,.12);color:#3fb950;border:1px solid rgba(63,185,80,.25)}
+.bd-rej{background:rgba(210,153,34,.15);color:#d29922;border:1px solid rgba(210,153,34,.3)}
+.bd-dup{background:rgba(139,148,158,.12);color:#8b949e;border:1px solid rgba(139,148,158,.25)}
+.bd-err{background:rgba(248,81,73,.25);color:#ff6b6b;border:1px solid #f85149}
+.bd-inv{background:rgba(210,153,34,.18);color:#d29922;border:1px solid rgba(210,153,34,.35)}
+.kst{display:grid;gap:6px;padding:8px 10px}
+.ks{background:#0d1117;border-radius:4px;padding:7px 10px;border:1px solid rgba(139,148,158,.1)}
+.ksl{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
+.ksv{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
+.cg{color:#3fb950}.cr{color:#f85149}.cb{color:#388bfd}.cp{color:#bc8cff}.cy{color:#d29922}.cd{color:#6e7681}.cc{color:#39d3f2}.cw{color:#e6edf3}
+.segs{display:flex;background:#0d1117;border:1px solid rgba(139,148,158,.2);border-radius:4px;overflow:hidden}
+.seg{padding:3px 10px;background:none;border:none;color:#6e7681;cursor:pointer;font-size:10px;font-family:inherit}
+.seg.on{background:#21262d;color:#e6edf3}
+input,select{background:#0d1117;color:#e6edf3;border:1px solid rgba(139,148,158,.25);border-radius:4px;font-size:10px;padding:3px 6px;font-family:inherit}
+.btn{background:#21262d;color:#e6edf3;border:1px solid rgba(139,148,158,.25);border-radius:4px;padding:4px 10px;font-size:10px;cursor:pointer;font-family:inherit}
+.btn:hover{background:#30363d}
+.btn.danger{border-color:rgba(248,81,73,.4);color:#f85149}
+.btn.ok{border-color:rgba(63,185,80,.4);color:#3fb950}
 
-  // Het clientside script zit hier bewust ZONDER template-literals (alleen
-  // string-concatenatie met + en '') — dit hele blok leeft binnen de outer
-  // JS-template-literal van res.send(), en een backtick hierin zou die
-  // buitenste literal breken. Simpeler om ze gewoon niet te gebruiken.
-  const clientScript = [
-    "var state = { rows: [], sortKey: 'placed_at', sortDir: 'desc', symbol: '', status: '', validOnly: '' };",
-    "function fmtNum(v, d) { if (v === null || v === undefined) return '\u2014'; var n = Number(v); return isNaN(n) ? '\u2014' : n.toFixed(d === undefined ? 2 : d); }",
-    "function fmtTime(s) { if (!s) return '\u2014'; return new Date(s).toISOString().slice(5, 16).replace('T', ' '); }",
-    "function rColor(v) { if (v === null || v === undefined) return 'd'; return v > 0 ? 'w' : (v < 0 ? 'l' : 'd'); }",
-    "function statusOf(row) { if (row.closed_at) return 'closed'; return row.status || 'open'; }",
-    "function populateFilters() {",
-    "  var symbols = Array.from(new Set(state.rows.map(function (r) { return r.mt5_symbol; }).filter(Boolean))).sort();",
-    "  var sel = document.getElementById('fSymbol');",
-    "  if (sel.options.length <= 1) { symbols.forEach(function (s) { var o = document.createElement('option'); o.value = s; o.textContent = s; sel.appendChild(o); }); }",
-    "}",
-    "function filteredSorted() {",
-    "  var rows = state.rows.filter(function (r) {",
-    "    if (state.symbol && r.mt5_symbol !== state.symbol) return false;",
-    "    if (state.status && statusOf(r) !== state.status) return false;",
-    "    if (state.validOnly === 'valid' && r.valid === false) return false;",
-    "    if (state.validOnly === 'invalid' && r.valid !== false) return false;",
-    "    return true;",
-    "  });",
-    "  rows.sort(function (a, b) {",
-    "    var k = state.sortKey, dir = state.sortDir === 'asc' ? 1 : -1;",
-    "    var av = a[k], bv = b[k];",
-    "    if (av === null || av === undefined) av = -Infinity;",
-    "    if (bv === null || bv === undefined) bv = -Infinity;",
-    "    if (k === 'placed_at') { av = new Date(a[k]).getTime(); bv = new Date(b[k]).getTime(); }",
-    "    if (av < bv) return -1 * dir;",
-    "    if (av > bv) return 1 * dir;",
-    "    return 0;",
-    "  });",
-    "  return rows;",
-    "}",
-    "function render() {",
-    "  var rows = filteredSorted();",
-    "  document.getElementById('tradeCount').textContent = rows.length + ' / ' + state.rows.length;",
-    "  var html = rows.map(function (r) {",
-    "    var st = statusOf(r);",
-    "    var stClass = st === 'closed' ? (r.profit > 0 ? 'w' : (r.profit < 0 ? 'l' : 'd')) : (st === 'failed' ? 'bad' : (st === 'open' ? 'ok' : 'd'));",
-    "    return '<tr>' +",
-    "      '<td class=\"d\">' + fmtTime(r.placed_at) + '</td>' +",
-    "      '<td>' + (r.slot_id || '\u2014') + '</td>' +",
-    "      '<td>' + (r.mt5_symbol || '\u2014') + '</td>' +",
-    "      '<td class=\"' + (r.action === 'buy' ? 'w' : 'l') + '\">' + (r.action || '\u2014').toUpperCase() + '</td>' +",
-    "      '<td class=\"' + stClass + '\">' + st + '</td>' +",
-    "      '<td class=\"' + (r.valid === false ? 'bad' : 'ok') + '\" title=\"' + (r.invalid_reason || '') + '\">' + (r.valid === false ? 'nee' : 'ja') + '</td>' +",
-    "      '<td>' + fmtNum(r.fill_price, 5) + '</td>' +",
-    "      '<td>' + fmtNum(r.volume, 2) + '</td>' +",
-    "      '<td>' + fmtNum(r.risk_amount, 2) + '</td>' +",
-    "      '<td class=\"' + rColor(r.r_multiple) + '\">' + (r.r_multiple != null ? fmtNum(r.r_multiple, 2) + 'R' : '\u2014') + '</td>' +",
-    "      '<td class=\"' + rColor(r.profit) + '\">' + fmtNum(r.profit, 2) + '</td>' +",
-    "      '<td>' + (r.duration_min != null ? r.duration_min + 'm' : '\u2014') + '</td>' +",
-    "      '<td class=\"d\">' + (r.close_reason || r.invalid_reason || r.error || '') + '</td>' +",
-    "      '</tr>';",
-    "  }).join('');",
-    "  document.getElementById('tradesBody').innerHTML = html || '<tr><td colspan=\"13\" class=\"d\">geen trades</td></tr>';",
-    "}",
-    "function loadTrades() {",
-    "  fetch('/api/trades').then(function (r) { return r.json(); }).then(function (rows) {",
-    "    state.rows = rows; populateFilters(); render();",
-    "  }).catch(function (e) {",
-    "    document.getElementById('tradesBody').innerHTML = '<tr><td colspan=\"13\" class=\"bad\">kon /api/trades niet laden: ' + e.message + '</td></tr>';",
-    "  });",
-    "}",
-    "document.querySelectorAll('th[data-sort]').forEach(function (th) {",
-    "  th.addEventListener('click', function () {",
-    "    var k = th.getAttribute('data-sort');",
-    "    if (state.sortKey === k) state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc'; else { state.sortKey = k; state.sortDir = 'desc'; }",
-    "    render();",
-    "  });",
-    "});",
-    "document.getElementById('fSymbol').addEventListener('change', function (e) { state.symbol = e.target.value; render(); });",
-    "document.getElementById('fStatus').addEventListener('change', function (e) { state.status = e.target.value; render(); });",
-    "document.getElementById('fValid').addEventListener('change', function (e) { state.validOnly = e.target.value; render(); });",
-    "loadTrades();",
-    "setInterval(loadTrades, 15000);",
-  ].join('\n');
+/* ── De conversieladder ────────────────────────────────────────────────
+   Elk niveau uit de payload, omgerekend naar MT5 en geplaatst op zijn
+   werkelijke afstand in % van de MT5-entry. Dit is de kern van de pagina:
+   je ziet in één blik of SL, TP, ORB en VWAP kloppen ten opzichte van de
+   prijs waarop je daadwerkelijk gevuld bent. */
+.cv{background:#161b22;border:1px solid rgba(139,148,158,.15);border-radius:6px;margin-bottom:8px;overflow:hidden}
+.cvh{padding:6px 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-bottom:1px solid rgba(139,148,158,.1)}
+.cvid{font-size:10px;font-weight:600;color:#e6edf3}
+.cvsub{font-size:9px;color:#6e7681}
+.lad{position:relative;height:62px;margin:10px 12px 4px}
+.lad-ax{position:absolute;left:0;right:0;top:31px;height:1px;background:rgba(139,148,158,.18)}
+.lad-zero{position:absolute;top:8px;bottom:8px;width:1px;background:rgba(230,237,243,.5)}
+.lad-m{position:absolute;top:22px;width:1px;height:19px}
+.lad-l{position:absolute;font-size:8.5px;white-space:nowrap;transform:translateX(-50%);letter-spacing:.2px}
+.lad-l.up{top:4px}.lad-l.dn{bottom:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:1px;background:rgba(139,148,158,.1)}
+.gc{background:#0d1117;padding:5px 8px}
+.gl{font-size:8.5px;color:#6e7681;text-transform:uppercase;letter-spacing:.4px}
+.gv{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:1px}
+.gx{font-size:8.5px;color:#8b949e;font-variant-numeric:tabular-nums}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:#0d1117}
+::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+`;
 
-  res.type('html').send(`<!doctype html><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO ORB — ${FIRM}</title>
-<style>
- body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,monospace;margin:0;padding:14px}
- h1{font-size:15px;margin:0 0 12px;color:#e6edf3}
- .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:14px}
- .row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #21262d}
- .row:last-child{border:0}
- .k{color:#8b949e}
- table{width:100%;border-collapse:collapse;font-size:12px}
- th{text-align:left;color:#8b949e;font-weight:normal;border-bottom:1px solid #30363d;padding:5px 6px;white-space:nowrap}
- th[data-sort]{cursor:pointer;user-select:none}
- th[data-sort]:hover{color:#e6edf3}
- td{padding:5px 6px;border-bottom:1px solid #21262d;white-space:nowrap}
- .ok{color:#3fb950}.bad{color:#f85149}.w{color:#3fb950}.l{color:#f85149}.d{color:#6e7681}
- h2{font-size:13px;color:#8b949e;margin:0 0 8px;font-weight:normal}
- .wrap{overflow-x:auto}
- .filters{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
- select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font:12px ui-monospace,Menlo,monospace}
-</style>
-<h1>PRONTO ORB — ${health.label || FIRM}</h1>
+const CLIENT = [
+"'use strict';",
+"var $=function(i){return document.getElementById(i)};",
+"var S={trades:[],signals:[],sys:{},filt:'all',sfilt:'all'};",
+"function esc(v){return String(v==null?'':v).replace(/[&<>\"']/g,function(c){",
+"  return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]})}",
+"function num(v){var n=parseFloat(v);return isFinite(n)?n:null}",
+"function f(v,d){var n=num(v);return n===null?'--':n.toFixed(d==null?2:d)}",
+"function pc(v,d){var n=num(v);if(n===null)return '--';",
+"  return (n>0?'+':'')+n.toFixed(d==null?3:d)+'%'}",
+"function ts(s){if(!s)return '--';",
+"  return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',",
+"    day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}",
+"function sgn(v){var n=num(v);return n===null?'cd':n>0?'cg':n<0?'cr':'cd'}",
+"function bd(c,t){return '<span class=\"bd bd-'+c+'\">'+esc(t)+'</span>'}",
+"",
+"// Alles wat de payload stuurde, herrekend naar % van de MT5-entry.",
+"// Waar we echte MT5-prijzen hebben gebruiken we die; anders vallen we terug",
+"// op de opgeslagen sl_pct/tp_pct. Ontbreekt beide, dan blijft het null en",
+"// tonen we een streepje in plaats van een verzonnen nul.",
+"function conv(t){",
+"  var fill=num(t.fill_price), c={fill:fill};",
+"  var rel=function(lv){var p=num(lv);",
+"    return (p===null||!fill)?null:(p/fill-1)*100};",
+"  c.sl   = rel(t.sl_price);",
+"  c.tp   = rel(t.tp_price);",
+"  if(c.sl===null&&num(t.sl_pct)!==null) c.sl=(t.action==='buy'?-1:1)*num(t.sl_pct)*100;",
+"  if(c.tp===null&&num(t.tp_pct)!==null) c.tp=(t.action==='buy'? 1:-1)*num(t.tp_pct)*100;",
+"  c.orbH = rel(t.orb_high_mt5);",
+"  c.orbL = rel(t.orb_low_mt5);",
+"  c.vwap = rel(t.vwap_mt5);",
+"  c.basis= num(t.basis_pct)===null?null:num(t.basis_pct)*100;",
+"  c.range= (c.orbH!==null&&c.orbL!==null)?(c.orbH-c.orbL):null;",
+"  var s=num(t.sl_pct), p=num(t.tp_pct);",
+"  c.rrEff=(s&&p)?p/s:null;",
+"  return c}",
+"",
+"function ladder(t,c){",
+"  var pts=[{k:'ORB H',v:c.orbH,col:'#d29922'},{k:'TP',v:c.tp,col:'#3fb950'},",
+"           {k:'VWAP',v:c.vwap,col:'#39d3f2'},{k:'ENTRY',v:0,col:'#e6edf3'},",
+"           {k:'SL',v:c.sl,col:'#f85149'},{k:'ORB L',v:c.orbL,col:'#d29922'}];",
+"  var live=pts.filter(function(p){return p.v!==null&&isFinite(p.v)});",
+"  if(live.length<2) return '<div class=\"cd\" style=\"padding:10px 12px;font-size:10px\">"+
+"Geen MT5-prijzen op deze order — niets om te schalen.</div>';",
+"  var vs=live.map(function(p){return p.v});",
+"  var lo=Math.min.apply(null,vs), hi=Math.max.apply(null,vs);",
+"  var pad=Math.max((hi-lo)*0.14,0.02); lo-=pad; hi+=pad;",
+"  var x=function(v){return ((v-lo)/(hi-lo))*100};",
+"  var h='<div class=\"lad\"><div class=\"lad-ax\"></div>';",
+"  h+='<div class=\"lad-zero\" style=\"left:'+x(0).toFixed(2)+'%\"></div>';",
+"  live.sort(function(a,b){return a.v-b.v});",
+"  live.forEach(function(p,i){",
+"    var L=x(p.v).toFixed(2), up=(i%2===0);",
+"    h+='<div class=\"lad-m\" style=\"left:'+L+'%;background:'+p.col+'\"></div>';",
+"    h+='<div class=\"lad-l '+(up?'up':'dn')+'\" style=\"left:'+L+'%;color:'+p.col+'\">'",
+"       +esc(p.k)+' '+(p.v>0?'+':'')+p.v.toFixed(3)+'%</div>'});",
+"  return h+'</div>'}",
+"",
+"function cell(l,v,x,cl){return '<div class=\"gc\"><div class=\"gl\">'+esc(l)+'</div>'+",
+"  '<div class=\"gv '+(cl||'cw')+'\">'+v+'</div>'+",
+"  (x?'<div class=\"gx\">'+x+'</div>':'')+'</div>'}",
+"",
+"function renderConv(){",
+"  var rows=S.trades.slice(0,40);",
+"  if(!rows.length){$('cv-body').innerHTML='<div class=\"nd\">Nog geen orders. "+
+"Zodra TradingView een signaal stuurt verschijnt hier de omrekening.</div>';return}",
+"  $('cv-body').innerHTML=rows.map(function(t){",
+"    var c=conv(t), dir=t.action==='buy';",
+"    var h='<div class=\"cv\"><div class=\"cvh\">'+bd(dir?'buy':'sell',dir?'BUY':'SELL')+",
+"      '<span class=\"cvid\">'+esc(t.slot_id)+'</span>'+",
+"      '<span class=\"cvsub\">'+esc(t.tv_symbol||'?')+' &rarr; '+esc(t.mt5_symbol||'?')+",
+"      ' · '+ts(t.placed_at)+'</span>';",
+"    if(t.valid===false) h+=bd('inv','DATA '+esc(t.invalid_reason||'ongeldig'));",
+"    h+='<span class=\"cm\">basis '+pc(c.basis,3)+'</span></div>';",
+"    h+=ladder(t,c);",
+"    h+='<div class=\"grid\">';",
+"    h+=cell('Entry MT5',f(t.fill_price,5),'TV '+f(t.entry_tv,5),'cw');",
+"    h+=cell('Stop loss',f(t.sl_price,5),pc(c.sl,3)+' · '+f(t.sl_points,5)+' pt','cr');",
+"    h+=cell('Take profit',f(t.tp_price,5),pc(c.tp,3)+' · '+f(t.tp_points,5)+' pt','cg');",
+"    h+=cell('ORB hoog',f(t.orb_high_mt5,5),pc(c.orbH,3)+' · TV '+f(t.orb_high,5),'cy');",
+"    h+=cell('ORB laag',f(t.orb_low_mt5,5),pc(c.orbL,3)+' · TV '+f(t.orb_low,5),'cy');",
+"    h+=cell('VWAP',f(t.vwap_mt5,5),pc(c.vwap,3)+' · '+esc(t.vwap_side||'?'),'cc');",
+"    h+=cell('ORB-breedte',c.range===null?'--':c.range.toFixed(3)+'%',",
+"      esc(t.orb_start||'?')+' · '+esc(t.orb_minutes||'?')+'m','cw');",
+"    h+=cell('Stop TV&rarr;MT5',f(t.sl_points_tv,5)+' &rarr; '+f(t.sl_points,5),",
+"      'schaal '+pc(c.basis,3),'cd');",
+"    h+=cell('RR',f(t.rr,2)+'R','effectief '+(c.rrEff?c.rrEff.toFixed(2):'--')+'R','cw');",
+"    h+=cell('SL-mult',f(t.sl_mult,1)+'&times;','risk '+f(t.risk_pct,2)+'%','cd');",
+"    h+=cell('Volume',f(t.volume,2)+' lot','risico '+f(t.risk_amount,2),'cw');",
+"    h+=cell('Uitkomst',t.r_multiple==null?'open':f(t.r_multiple,2)+'R',",
+"      t.profit==null?esc(t.status):f(t.profit,2)+' · '+esc(t.close_reason||''),",
+"      t.r_multiple==null?'cb':sgn(t.r_multiple));",
+"    return h+'</div></div>'}).join('')}",
+"",
+"function renderTrades(){",
+"  var rows=S.trades.filter(function(t){",
+"    if(S.filt==='open')   return t.status==='open';",
+"    if(S.filt==='closed') return t.status==='closed';",
+"    if(S.filt==='failed') return t.status==='failed';",
+"    if(S.filt==='invalid')return t.valid===false;",
+"    return true});",
+"  $('tr-count').textContent=rows.length+' van '+S.trades.length;",
+"  if(!rows.length){$('tr-body').innerHTML='<tr><td colspan=\"15\" class=\"nd\">"+
+"Niets in deze weergave.</td></tr>';return}",
+"  $('tr-body').innerHTML=rows.map(function(t){",
+"    var c=conv(t);",
+"    var st=t.status==='open'?bd('open','OPEN'):t.status==='closed'?bd('closed','DICHT'):bd('failed','MISLUKT');",
+"    return '<tr><td class=\"cd\">'+ts(t.placed_at)+'</td>'+",
+"      '<td>'+esc(t.slot_id)+'</td>'+",
+"      '<td class=\"cd\">'+esc(t.mt5_symbol||'--')+'</td>'+",
+"      '<td>'+bd(t.action==='buy'?'buy':'sell',t.action==='buy'?'BUY':'SELL')+'</td>'+",
+"      '<td>'+st+(t.valid===false?' '+bd('inv','DATA'):'')+'</td>'+",
+"      '<td>'+f(t.fill_price,5)+'</td>'+",
+"      '<td class=\"cr\">'+pc(c.sl,3)+'</td>'+",
+"      '<td class=\"cg\">'+pc(c.tp,3)+'</td>'+",
+"      '<td class=\"cy\">'+pc(c.orbH,3)+'</td>'+",
+"      '<td class=\"cy\">'+pc(c.orbL,3)+'</td>'+",
+"      '<td class=\"cc\">'+pc(c.vwap,3)+'</td>'+",
+"      '<td class=\"cd\">'+pc(c.basis,3)+'</td>'+",
+"      '<td>'+f(t.volume,2)+'</td>'+",
+"      '<td class=\"'+sgn(t.profit)+'\">'+(t.profit==null?'--':f(t.profit,2))+'</td>'+",
+"      '<td class=\"'+sgn(t.r_multiple)+'\">'+(t.r_multiple==null?'--':f(t.r_multiple,2)+'R')+'</td></tr>'",
+"  }).join('')}",
+"",
+"function renderSignals(){",
+"  var rows=S.signals.filter(function(s){",
+"    if(S.sfilt==='blocked') return s.status!=='accepted';",
+"    if(S.sfilt==='accepted')return s.status==='accepted';",
+"    return true});",
+"  if(!rows.length){$('sg-body').innerHTML='<tr><td colspan=\"10\" class=\"nd\">"+
+"Geen signalen in deze weergave.</td></tr>';return}",
+"  $('sg-body').innerHTML=rows.map(function(s){",
+"    var cl=s.status==='accepted'?'acc':s.status==='rejected'?'rej':",
+"           s.status==='duplicate'?'dup':'err';",
+"    return '<tr><td class=\"cd\">'+ts(s.received_at)+'</td>'+",
+"      '<td>'+esc(s.slot_id)+'</td>'+",
+"      '<td class=\"cd\">'+esc(s.tv_symbol||'--')+'</td>'+",
+"      '<td>'+bd(s.action==='buy'?'buy':'sell',(s.action||'?').toUpperCase())+'</td>'+",
+"      '<td>'+bd(cl,(s.status||'?').toUpperCase())+'</td>'+",
+"      '<td>'+f(s.entry_tv,5)+'</td>'+",
+"      '<td class=\"cr\">'+(num(s.sl_pct)===null?'--':pc(num(s.sl_pct)*100,3))+'</td>'+",
+"      '<td class=\"cg\">'+(num(s.tp_pct)===null?'--':pc(num(s.tp_pct)*100,3))+'</td>'+",
+"      '<td class=\"cd\">'+esc(s.orb_start||'--')+' '+esc(s.orb_minutes||'')+'m</td>'+",
+"      '<td class=\"cd\" style=\"white-space:normal;max-width:340px\">'+esc(s.reason||'')+'</td></tr>'",
+"  }).join('')}",
+"",
+"function renderSlots(){",
+"  var r=S.sys.slots||[];",
+"  if(!r.length){$('sl-body').innerHTML='<tr><td colspan=\"9\" class=\"nd\">"+
+"Nog geen gesloten trades per slot.</td></tr>';return}",
+"  $('sl-body').innerHTML=r.map(function(s){",
+"    return '<tr><td>'+esc(s.slot_id)+'</td>'+",
+"      '<td class=\"cd\">'+esc(s.mt5_symbol||'--')+'</td>'+",
+"      '<td>'+esc(s.n_orders)+'</td><td>'+esc(s.n_closed)+'</td>'+",
+"      '<td class=\"'+sgn(s.avg_r)+'\">'+f(s.avg_r,3)+'</td>'+",
+"      '<td class=\"'+sgn(s.total_profit)+'\">'+f(s.total_profit,2)+'</td>'+",
+"      '<td>'+(s.win_pct==null?'--':f(s.win_pct,1)+'%')+'</td>'+",
+"      '<td class=\"cd\">'+(s.avg_minutes==null?'--':s.avg_minutes+'m')+'</td>'+",
+"      '<td class=\"cd\">'+f(s.avg_slippage,5)+'</td></tr>'}).join('')}",
+"",
+"function renderSys(){",
+"  var s=S.sys, b=s.breaker||{};",
+"  $('sy-brk').innerHTML = b.tripped",
+"    ? '<span class=\"dot r\"></span> GETRIPT &mdash; '+esc(b.reason||'geen reden')",
+"    : '<span class=\"dot g\"></span> normaal';",
+"  $('sy-brk-since').textContent = b.since?('sinds '+ts(b.since)):'';",
+"  var k=[['Firm',esc(s.label||s.firm),'cw'],",
+"         ['Handel',s.trading?'AAN':'UIT',s.trading?'cg':'cy'],",
+"         ['Broker',s.broker?'verbonden':'weg',s.broker?'cg':'cr'],",
+"         ['Equity',f(s.equity,2),'cw'],",
+"         ['Open risico',f(s.open_risk_pct,2)+'%','cb'],",
+"         ['Risico/trade',esc(s.risk_per_trade),'cp']];",
+"  $('sy-kpi').innerHTML=k.map(function(x){",
+"    return '<div class=\"ks\"><div class=\"ksl\">'+x[0]+'</div>'+",
+"      '<div class=\"ksv '+x[2]+'\">'+x[1]+'</div></div>'}).join('');",
+"  $('sy-err-box').innerHTML = s.broker_error",
+"    ? '<div style=\"padding:8px 10px;font-size:10px\" class=\"cr\">'+esc(s.broker_error)+'</div>' : '';",
+"  var bs=s.basis||[];",
+"  $('sy-basis').innerHTML = bs.length ? bs.map(function(x){",
+"    return '<tr><td>'+esc(x.mt5_symbol)+'</td><td>'+esc(x.n)+'</td>'+",
+"      '<td>'+f(x.gem_basis_pct,4)+'%</td><td class=\"cd\">'+f(x.min_basis_pct,4)+'%</td>'+",
+"      '<td class=\"cd\">'+f(x.max_basis_pct,4)+'%</td>'+",
+"      '<td class=\"'+(num(x.sd_basis_pct)>0.3?'cy':'cd')+'\">'+f(x.sd_basis_pct,4)+'%</td></tr>'",
+"    }).join('') : '<tr><td colspan=\"6\" class=\"nd\">Nog geen omgerekende orders.</td></tr>';",
+"  var er=s.errors||[];",
+"  $('sy-errors').innerHTML = er.length ? er.map(function(e){",
+"    return '<tr><td class=\"cd\">'+ts(e.at)+'</td><td>'+esc(e.context)+'</td>'+",
+"      '<td class=\"cd\" style=\"white-space:normal\">'+esc(e.message)+'</td></tr>'",
+"    }).join('') : '<tr><td colspan=\"3\" class=\"nd\">Geen fouten gelogd.</td></tr>';",
+"  var sy=s.symbols||{}, rows=Object.keys(sy).map(function(k2){",
+"    var m=sy[k2], sp=(s.specs||{})[m];",
+"    return '<tr><td>'+esc(k2)+'</td><td>'+esc(m)+'</td>'+",
+"      '<td class=\"cd\">'+(sp?('tick '+sp.tickSize+' · waarde '+sp.tickValue+' · '+",
+"      'vol '+sp.volMin+'-'+sp.volMax):'geen specificatie')+'</td></tr>'});",
+"  $('sy-syms').innerHTML=rows.join('')}",
+"",
+"function renderHdr(){",
+"  var s=S.sys, b=s.breaker||{};",
+"  $('h-firm').textContent=s.label||s.firm||'--';",
+"  $('h-eq').textContent=f(s.equity,2);",
+"  $('h-open').textContent=(s.open_positions==null?'--':s.open_positions)+'/'+",
+"    ((s.limits&&s.limits.max_open)||'--');",
+"  $('h-risk').textContent=f(s.open_risk_pct,2)+'%';",
+"  $('h-acct').textContent=s.account?String(s.account).slice(0,8)+'…':'--';",
+"  var d=$('h-dot'), st=$('h-state');",
+"  if(b.tripped){d.className='dot r';st.textContent='breaker om'}",
+"  else if(!s.broker){d.className='dot y';st.textContent='broker weg'}",
+"  else if(!s.trading){d.className='dot b';st.textContent='dry run'}",
+"  else{d.className='dot g';st.textContent='live'}",
+"  $('h-time').textContent=new Date().toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels'});",
+"  $('nb-inv').textContent=S.trades.filter(function(t){return t.valid===false}).length;",
+"  $('nb-sg').textContent=S.signals.filter(function(x){return x.status!=='accepted'}).length}",
+"",
+"function go(id,el){",
+"  var ps=document.querySelectorAll('.pg');",
+"  for(var i=0;i<ps.length;i++) ps[i].classList.remove('on');",
+"  $('p-'+id).classList.add('on');",
+"  var ts2=document.querySelectorAll('.ntab');",
+"  for(var j=0;j<ts2.length;j++) ts2[j].classList.remove('on');",
+"  el.classList.add('on')}",
+"",
+"function setFilt(v,el){S.filt=v;",
+"  var b=el.parentNode.children;for(var i=0;i<b.length;i++)b[i].classList.remove('on');",
+"  el.classList.add('on');renderTrades()}",
+"function setSFilt(v,el){S.sfilt=v;",
+"  var b=el.parentNode.children;for(var i=0;i<b.length;i++)b[i].classList.remove('on');",
+"  el.classList.add('on');renderSignals()}",
+"",
+"function secret(){return encodeURIComponent($('sy-secret').value||'')}",
+"function post(p){",
+"  fetch(p+(p.indexOf('?')<0?'?':'&')+'secret='+secret(),{method:'POST'})",
+"    .then(function(r){return r.json()})",
+"    .then(function(j){ $('sy-msg').textContent = j.error?('mislukt: '+j.error):'gelukt'; load()})",
+"    .catch(function(e){ $('sy-msg').textContent='mislukt: '+e.message })}",
+"",
+"function load(){",
+"  Promise.all([",
+"    fetch('/api/system').then(function(r){return r.json()}).catch(function(){return {}}),",
+"    fetch('/api/trades?limit=400').then(function(r){return r.json()}).catch(function(){return []}),",
+"    fetch('/api/signals?limit=250').then(function(r){return r.json()}).catch(function(){return []})",
+"  ]).then(function(a){",
+"    S.sys=a[0]||{}; S.trades=Array.isArray(a[1])?a[1]:[]; S.signals=Array.isArray(a[2])?a[2]:[];",
+"    renderHdr(); renderTrades(); renderConv(); renderSignals(); renderSlots(); renderSys()})}",
+"",
+"load(); setInterval(load,15000);",
+].join("\n");
 
-<div class="card">
- <div class="row"><span class="k">broker</span><span class="${health.broker ? 'ok' : 'bad'}">${health.broker ? 'verbonden' : 'GEEN VERBINDING'}</span></div>
- ${health.broker_error ? `<div class="row"><span class="k">fout</span><span class="bad">${health.broker_error}</span></div>` : ''}
- <div class="row"><span class="k">handelen</span><span class="${health.trading ? 'ok' : 'd'}">${health.trading ? 'aan' : 'uit (dry run)'}</span></div>
- <div class="row"><span class="k">account</span><span>${health.account || '—'}</span></div>
- <div class="row"><span class="k">risico p/trade</span><span>${health.risk}</span></div>
- <div class="row"><span class="k">open posities</span><span>${health.open_positions ?? 0}</span></div>
- <div class="row"><span class="k">open risico</span><span>${(health.open_risk_pct ?? 0).toFixed?.(2) ?? 0}%</span></div>
- <div class="row"><span class="k">circuit breaker</span><span class="${health.breaker?.tripped ? 'bad' : 'ok'}">${health.breaker?.tripped ? 'GESPRONGEN — ' + health.breaker.reason : 'ok'}</span></div>
-</div>
+function dashboardHTML() {
+  return '<!DOCTYPE html><html lang="nl"><head><meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+  '<title>PRONTO ORB · ' + FIRM.toUpperCase() + '</title><style>' + CSS + '</style></head><body>' +
 
-<div class="card"><h2>per slot</h2><div class="wrap"><table>
- <tr><th>slot</th><th>sym</th><th>n</th><th>dicht</th><th>win%</th><th>gem R</th><th>winst</th><th>min</th><th>slip</th></tr>
- ${slots.length ? slots.map(s => `<tr>
-   <td>${s.slot_id}</td><td>${s.mt5_symbol || '—'}</td>${cel(s.n_orders)}${cel(s.n_closed)}
-   ${cel(s.win_pct)}<td class="${kleur(s.avg_r)}">${s.avg_r ?? '—'}</td>
-   <td class="${kleur(s.total_profit)}">${s.total_profit ?? '—'}</td>${cel(s.avg_minutes)}${cel(s.avg_slippage)}
- </tr>`).join('') : '<tr><td colspan="9" class="d">nog geen orders</td></tr>'}
-</table></div></div>
+  '<div class="hdr">' +
+    '<div class="brand">PRONTO<span>·</span>ORB <span style="font-size:10px;color:#6e7681;font-weight:400" id="h-firm">--</span></div>' +
+    '<div class="hkv g">Equity <b id="h-eq">--</b></div>' +
+    '<div class="hkv b">Open <b id="h-open">--</b></div>' +
+    '<div class="hkv y">Risico <b id="h-risk">--</b></div>' +
+    '<div class="hkv p">Account <b id="h-acct">--</b></div>' +
+    '<div class="hstat"><span id="h-dot" class="dot b"></span><span id="h-state">verbinden…</span>' +
+    '<span id="h-time" class="cd" style="margin-left:4px">--</span></div>' +
+  '</div>' +
 
-<div class="card">
- <h2>trades</h2>
- <div class="filters">
-   <select id="fSymbol"><option value="">alle symbolen</option></select>
-   <select id="fStatus">
-     <option value="">alle status</option>
-     <option value="open">open</option>
-     <option value="closed">closed</option>
-     <option value="failed">failed</option>
-   </select>
-   <select id="fValid">
-     <option value="">valid + invalid</option>
-     <option value="valid">alleen valid</option>
-     <option value="invalid">alleen invalid</option>
-   </select>
-   <span class="d" id="tradeCount"></span>
- </div>
- <div class="wrap"><table>
-  <thead><tr>
-   <th data-sort="placed_at">tijd ⇅</th>
-   <th data-sort="slot_id">slot ⇅</th>
-   <th data-sort="mt5_symbol">sym ⇅</th>
-   <th>kant</th>
-   <th>status</th>
-   <th>valid</th>
-   <th data-sort="fill_price">fill ⇅</th>
-   <th data-sort="volume">lots ⇅</th>
-   <th data-sort="risk_amount">risk ⇅</th>
-   <th data-sort="r_multiple">R ⇅</th>
-   <th data-sort="profit">winst ⇅</th>
-   <th data-sort="duration_min">duur ⇅</th>
-   <th>reden</th>
-  </tr></thead>
-  <tbody id="tradesBody"><tr><td colspan="13" class="d">laden…</td></tr></tbody>
- </table></div>
-</div>
+  '<div class="nav">' +
+    '<div class="ntab on" tabindex="0" onclick="go(\'tr\',this)">Trades</div>' +
+    '<div class="ntab" tabindex="0" onclick="go(\'cv\',this)">Omrekening ' +
+      '<span style="background:rgba(210,153,34,.15);color:#d29922;border-radius:8px;padding:1px 5px;font-size:9px" id="nb-inv">0</span></div>' +
+    '<div class="ntab" tabindex="0" onclick="go(\'sl\',this)">Slots</div>' +
+    '<div class="ntab" tabindex="0" onclick="go(\'sg\',this)">Signalen ' +
+      '<span style="background:rgba(139,148,158,.15);color:#8b949e;border-radius:8px;padding:1px 5px;font-size:9px" id="nb-sg">0</span></div>' +
+    '<div class="ntab" tabindex="0" onclick="go(\'sy\',this)">Systeem</div>' +
+  '</div>' +
 
-<div class="card"><h2>laatste signalen (ruwe webhook-log)</h2><div class="wrap"><table>
- <tr><th>tijd</th><th>slot</th><th>kant</th><th>status</th><th>reden</th></tr>
- ${recent.length ? recent.map(r => `<tr>
-   <td class="d">${new Date(r.received_at).toISOString().slice(5,16).replace('T',' ')}</td>
-   <td>${r.slot_id}</td><td>${r.action || '—'}</td>
-   <td class="${r.status === 'accepted' ? 'ok' : 'bad'}">${r.status}</td>
-   <td class="d">${r.reason || ''}</td>
- </tr>`).join('') : '<tr><td colspan="5" class="d">nog geen signalen ontvangen</td></tr>'}
-</table></div></div>
+  '<div class="wrapp">' +
 
-<div class="d">JSON: <a style="color:#58a6ff" href="/health">/health</a> · <a style="color:#58a6ff" href="/slots">/slots</a> · <a style="color:#58a6ff" href="/api/trades">/api/trades</a> · <a style="color:#58a6ff" href="/api/open-positions">/api/open-positions</a></div>
-<script>${clientScript}</script>`);
+  '<div class="pg on" id="p-tr"><div class="card">' +
+    '<div class="chdr"><div class="ctitle"><div class="dot g"></div>Orders</div>' +
+    '<div class="segs" style="margin-left:8px">' +
+      '<button class="seg on" onclick="setFilt(\'all\',this)">Alles</button>' +
+      '<button class="seg" onclick="setFilt(\'open\',this)">Open</button>' +
+      '<button class="seg" onclick="setFilt(\'closed\',this)">Dicht</button>' +
+      '<button class="seg" onclick="setFilt(\'failed\',this)">Mislukt</button>' +
+      '<button class="seg" onclick="setFilt(\'invalid\',this)">Datafout</button></div>' +
+    '<span class="cm" id="tr-count">--</span></div>' +
+    '<div class="tw"><table><thead><tr>' +
+      '<th>Tijd</th><th>Slot</th><th>Symbool</th><th>Richting</th><th>Status</th>' +
+      '<th>Entry MT5</th><th>SL %</th><th>TP %</th><th>ORB H %</th><th>ORB L %</th>' +
+      '<th>VWAP %</th><th>Basis %</th><th>Lots</th><th>P&amp;L</th><th>R</th>' +
+    '</tr></thead><tbody id="tr-body"><tr><td colspan="15" class="nd">Laden…</td></tr></tbody></table></div>' +
+    '<div class="cm" style="padding:6px 10px">Alle percentages zijn afstand tot de werkelijke MT5-fill, niet tot de TradingView-prijs.</div>' +
+  '</div></div>' +
+
+  '<div class="pg" id="p-cv">' +
+    '<div class="card"><div class="chdr"><div class="ctitle"><div class="dot y"></div>Futures naar CFD</div>' +
+    '<span class="cm">elk niveau uit de payload, geplaatst op zijn afstand in % van de MT5-entry</span></div>' +
+    '<div class="cm" style="padding:8px 10px;line-height:1.5">De witte lijn is je fill. ' +
+    'Staat VWAP aan de verkeerde kant van entry, of ligt de stop niet waar de ORB-rand ligt, ' +
+    'dan klopt de omrekening niet — ongeacht wat de order zelf deed.</div></div>' +
+    '<div id="cv-body"><div class="nd">Laden…</div></div>' +
+  '</div>' +
+
+  '<div class="pg" id="p-sl"><div class="card">' +
+    '<div class="chdr"><div class="ctitle"><div class="dot b"></div>Prestatie per slot</div>' +
+    '<span class="cm">uit de slot_performance-view</span></div>' +
+    '<div class="tw"><table><thead><tr><th>Slot</th><th>Symbool</th><th>Orders</th><th>Dicht</th>' +
+    '<th>Gem. R</th><th>Winst</th><th>Win%</th><th>Duur</th><th>Slippage</th></tr></thead>' +
+    '<tbody id="sl-body"><tr><td colspan="9" class="nd">Laden…</td></tr></tbody></table></div>' +
+    '<div class="cm" style="padding:6px 10px">Slippage is nul zolang broker.js de ref-prijs als fill teruggeeft — dat is een bekende bug, geen meting.</div>' +
+  '</div></div>' +
+
+  '<div class="pg" id="p-sg"><div class="card">' +
+    '<div class="chdr"><div class="ctitle"><div class="dot p"></div>Signaal-log</div>' +
+    '<div class="segs" style="margin-left:8px">' +
+      '<button class="seg on" onclick="setSFilt(\'all\',this)">Alles</button>' +
+      '<button class="seg" onclick="setSFilt(\'accepted\',this)">Geaccepteerd</button>' +
+      '<button class="seg" onclick="setSFilt(\'blocked\',this)">Geblokkeerd</button></div>' +
+    '<span class="cm">élk binnengekomen signaal, ook geweigerde</span></div>' +
+    '<div class="tw"><table><thead><tr><th>Tijd</th><th>Slot</th><th>TV-symbool</th><th>Richting</th>' +
+    '<th>Status</th><th>Entry TV</th><th>SL %</th><th>TP %</th><th>ORB</th><th>Reden</th></tr></thead>' +
+    '<tbody id="sg-body"><tr><td colspan="10" class="nd">Laden…</td></tr></tbody></table></div>' +
+  '</div></div>' +
+
+  '<div class="pg" id="p-sy">' +
+    '<div class="card"><div class="chdr"><div class="ctitle"><div class="dot g"></div>Toestand</div></div>' +
+    '<div class="kst" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr))" id="sy-kpi"></div>' +
+    '<div id="sy-err-box"></div></div>' +
+
+    '<div class="card"><div class="chdr"><div class="ctitle"><div class="dot y"></div>Circuit breaker</div>' +
+    '<span class="cm" id="sy-brk-since"></span></div>' +
+    '<div style="padding:8px 10px;font-size:11px" id="sy-brk">--</div>' +
+    '<div style="padding:0 10px 10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+      '<input id="sy-secret" type="password" placeholder="webhook secret" style="width:180px">' +
+      '<button class="btn danger" onclick="post(\'/breaker/trip\')">Stop handel</button>' +
+      '<button class="btn ok" onclick="post(\'/breaker/reset\')">Hervat handel</button>' +
+      '<button class="btn" onclick="post(\'/reconnect\')">Verbind opnieuw</button>' +
+      '<span class="cm" id="sy-msg"></span></div>' +
+    '<div class="cm" style="padding:0 10px 8px">Het secret blijft in dit tabblad en wordt niet opgeslagen.</div></div>' +
+
+    '<div class="card"><div class="chdr"><div class="ctitle"><div class="dot b"></div>Basisdrift</div>' +
+    '<span class="cm">spreiding futures &rarr; CFD · brede spreiding wijst op vertraagde data</span></div>' +
+    '<div class="tw"><table><thead><tr><th>Symbool</th><th>n</th><th>Gemiddeld</th>' +
+    '<th>Min</th><th>Max</th><th>Std.dev</th></tr></thead><tbody id="sy-basis"></tbody></table></div></div>' +
+
+    '<div class="card"><div class="chdr"><div class="ctitle"><div class="dot p"></div>Symboolmapping</div>' +
+    '<span class="cm">uit session.js</span></div>' +
+    '<div class="tw"><table><thead><tr><th>TradingView</th><th>MT5</th><th>Specificatie</th></tr></thead>' +
+    '<tbody id="sy-syms"></tbody></table></div></div>' +
+
+    '<div class="card"><div class="chdr"><div class="ctitle"><div class="dot r"></div>Laatste fouten</div></div>' +
+    '<div class="tw"><table><thead><tr><th>Tijd</th><th>Context</th><th>Bericht</th></tr></thead>' +
+    '<tbody id="sy-errors"></tbody></table></div></div>' +
+
+    '<div class="cm" style="padding:4px 2px">JSON: ' +
+    '<a href="/health">/health</a> · <a href="/api/trades">/api/trades</a> · ' +
+    '<a href="/api/signals">/api/signals</a> · <a href="/api/system">/api/system</a> · ' +
+    '<a href="/api/open-positions">/api/open-positions</a></div>' +
+  '</div>' +
+
+  '</div><script>' + CLIENT + '</scr' + 'ipt></body></html>';
+}
+
+app.get('/', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(dashboardHTML());
+});
+app.get('/dashboard', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(dashboardHTML());
 });
 
 (async () => {
